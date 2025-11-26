@@ -8,6 +8,7 @@
   "dependencies": {
     "@supabase/supabase-js": "^2.45.2",
     "node-fetch": "^3.3.2",
+    "express": "^4.21.1",
     "ws": "^8.18.0"
   }
 }
