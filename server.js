@@ -1,17 +1,20 @@
-// server.js — стабильный клиент, правильный JSON-PONG, фильтр спама
+// server.js — стабильный Centrifugo WebSocket клиент
 import WebSocket from "ws";
 import fetch from "node-fetch";
 
 const WS_URL = "wss://ws.cs2run.app/connection/websocket";
 const CHANNELS = ["csgorun:crash", "csgorun:main"];
-const RECONNECT_INTERVAL_MS = 5 * 60 * 1000; // 5 минут
+const FORCE_RECONNECT_MS = 5 * 60 * 1000; // 5 минут
 
 let ws;
-let forceReconnectTimer;
+let lastPingTs = null;
+let reconnectTimer;
 
-function log(...a){ console.log("[INFO]", ...a); }
+function log(...a) {
+  console.log("[INFO]", ...a);
+}
 
-async function getToken() {
+async function fetchToken() {
   log("Fetching token...");
   try {
     const r = await fetch("https://cs2run.app/current-state", {
@@ -22,28 +25,34 @@ async function getToken() {
     log(`Token: ${token ? "FOUND" : "NOT FOUND"}`);
     return token;
   } catch (err) {
-    log("Token fetch failed:", err.message);
+    log("Token fetch error:", err.message);
     return null;
   }
 }
 
 async function startWS() {
-  const token = await getToken();
+  const token = await fetchToken();
   if (!token) {
-    log("Retry in 3s");
+    log("Retry in 3s...");
     return setTimeout(startWS, 3000);
   }
 
-  log(`Connecting to ${WS_URL}`);
-  ws = new WebSocket(WS_URL);
+  log(`Connecting to ${WS_URL}...`);
+  ws = new WebSocket(WS_URL, {
+    headers: {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+      "Origin": "https://cs2run.app",
+      "Sec-WebSocket-Protocol": "centrifugo.v2.json"
+    }
+  });
 
   ws.on("open", () => {
     log("[WS] OPEN");
 
     ws.send(JSON.stringify({
-  id: 1,
-  connect: { token, subs: {} }
-}));
+      id: 1,
+      connect: { token, subs: {} }
+    }));
     log("[CONNECT] sent");
 
     setTimeout(() => {
@@ -56,54 +65,48 @@ async function startWS() {
       });
     }, 200);
 
-    if (forceReconnectTimer) clearTimeout(forceReconnectTimer);
-    forceReconnectTimer = setTimeout(() => {
-      log("5 minutes passed → force reconnect");
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    reconnectTimer = setTimeout(() => {
+      log("[RECONNECT] timeout reached → reconnect");
       safeClose();
-    }, RECONNECT_INTERVAL_MS);
+    }, FORCE_RECONNECT_MS);
   });
 
   ws.on("message", raw => {
-    let arr;
-    try {
-      arr = JSON.parse(raw);
-    } catch {
-      return;
-    }
+    let msg;
+    try { msg = JSON.parse(raw); }
+    catch { return; }
 
-    const msgs = Array.isArray(arr) ? arr : [arr];
+    const arr = Array.isArray(msg) ? msg : [msg];
 
-    for (const msg of msgs) {
-      // === SERVER PING (Centrifugo protocol) ===
-      if (msg.ping !== undefined) {
-        log("[PING] <-", JSON.stringify(msg));
+    for (const m of arr) {
+      // Server PING (важная часть!)
+      if (m.ping !== undefined) {
+        lastPingTs = Date.now();
+        log("[PING] <-", JSON.stringify(m));
         ws.send(JSON.stringify({ pong: {} }));
-        log("[PONG] -> {pong:{}}");
+        log("[PONG] -> {}");
         continue;
       }
 
-      // CONNECT OK
-      if (msg.result && msg.id === 1) {
+      if (m.result && m.id === 1) {
         log("[ACK] CONNECT OK");
         continue;
       }
 
-      // SUBSCRIBE OK
-      if (msg.id === 100 || msg.id === 101) {
-        log("[ACK] SUB OK id=" + msg.id);
+      if (m.id === 100 || m.id === 101) {
+        log(`[ACK] SUB OK id=${m.id}`);
         continue;
       }
 
-      // Игровые push нам пока не нужны (очень много трафика)
-      if (msg.push) continue;
+      if (m.push) continue; // фильтр игрового спама
 
-      // Остальное → показать (редко)
-      log("[MSG]", msg);
+      log("[MSG]", m);
     }
   });
 
   ws.on("close", (code, reason) => {
-    log(`[CLOSE] code=${code}, reason=${reason || "(none)"}`);
+    log(`[CLOSE] code=${code} reason=${reason || "(none)"}`);
     restart("close");
   });
 
@@ -113,8 +116,8 @@ async function startWS() {
   });
 }
 
-function restart(reason) {
-  log(`[RESTART] cause=${reason}`);
+function restart(cause) {
+  log(`[RESTART] cause=${cause}`);
   setTimeout(startWS, 2000);
 }
 
