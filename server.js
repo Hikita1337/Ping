@@ -68,32 +68,44 @@ async function start() {
   });
 
   ws.on("message", raw => {
-    let msg;
-    try { msg = JSON.parse(raw); } catch { return; }
+  let msg;
+  try { msg = JSON.parse(raw); } catch {
+    console.log("[RAW]", raw.toString());
+    return;
+  }
 
-    const arr = Array.isArray(msg) ? msg : [msg];
+  const arr = Array.isArray(msg) ? msg : [msg];
 
-    arr.forEach(m => {
+  arr.forEach(m => {
+    // Логируем всё для анализа (но только в консоль!)
+    console.log("[WS MSG]", JSON.stringify(m).slice(0, 300));
 
-      if (m.ping !== undefined) {
-        logEvent("ping", "server");
-        ws.send(JSON.stringify({ pong: {} }));
-        logEvent("pong", "client");
-        return;
-      }
+    // Вариант 1: ping в старом формате
+    if (m.ping !== undefined) {
+      logEvent("ping", "server");
+      ws.send(JSON.stringify({ pong: {} }));
+      logEvent("pong", "client");
+      return;
+    }
 
-      if (m.id === 1 && m.result) {
-        logEvent("connect_ok", "server");
-        return;
-      }
+    // Вариант 2: format by Centrifugo: { "method": "ping" }
+    if (m.method === "ping") {
+      logEvent("ping", "server");
+      ws.send(JSON.stringify({ method: "pong" }));
+      logEvent("pong", "client");
+      return;
+    }
 
-      if (m.id === 100 || m.id === 101) {
-        logEvent("sub_ok", "server", { id: m.id });
-        return;
-      }
-    });
+    // CONNECT OK
+    if (m.result && m.id === 1) return logEvent("connect_ok", "server");
+
+    // SUB OK
+    if (m.id === 100 || m.id === 101)
+      return logEvent("sub_ok", "server", { id: m.id });
+
+    // всё остальное — пропускаем
   });
-
+});
   ws.on("close", (code, reason) => {
     console.log("[CLOSE]", code, reason?.toString());
     logEvent("close", "server", { code, reason });
