@@ -1,278 +1,263 @@
 // server.js
 import WebSocket from "ws";
 import fetch from "node-fetch";
-import { createClient } from "@supabase/supabase-js";
 
-/*
-  Настройки — можно перенести в env vars (рекомендую).
-  Если не задать, используются значения по-умолчанию ниже.
-*/
+/**
+ * Simple, robust WS client for testing handshake + ping/pong behavior.
+ * - No DB writes
+ * - No push payload logging (spam)
+ * - Subscribes to system channel only (safe)
+ * - Handles BOTH transport-level ping (ws 'ping' event) and JSON-level ping (message with .ping)
+ * - Does NOT proactively send pongs on open; replies only when ping arrives (to avoid premature pong)
+ * - Exponential backoff on reconnect + periodic forced reconnect every 5 minutes
+ *
+ * ENV:
+ *  - WS_URL (default wss://ws.cs2run.app/connection/websocket)
+ *  - ORIGIN (default https://csgoyz.run)
+ *  - UA (optional user-agent)
+ */
+
 const WS_URL = process.env.WS_URL || "wss://ws.cs2run.app/connection/websocket";
-const CHANNELS = [
-  "system:public" /* пример служебного канала (если нужен реальный - см. логи) */,
-  "status"            /* твой выбор: status */
-];
-const RECONNECT_INTERVAL_MS = 5 * 60 * 1000; // форс-реконнект каждые 5 мин
-const MAX_BACKOFF_MS = 5 * 60 * 1000; // максимум backoff 5 минут
-const BASE_BACKOFF_MS = 1000; // стартовый backoff 1s
+const ORIGIN = process.env.ORIGIN || "https://csgoyz.run";
 const UA = process.env.UA || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
-const ORIGIN = process.env.ORIGIN || "https://csgoyz.run"; // ставим origin сайта
 
-// Supabase
-const SUPABASE_URL = process.env.SUPABASE_URL || "https://pdsuiqmddqsllarznceh.supabase.co";
-const SUPABASE_KEY = process.env.SUPABASE_KEY || "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBkc3VpcW1kZHFzbGxhcnpuY2VoIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2MTc4MjM5MywiZXhwIjoyMDc3MzU4MzkzfQ.oz3-A6R7V7FM2ZKyTV1BrMEhrZKvTherL9sCyCteIXE";
-const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+// channels: only system (safe). we avoid crash push logging; can add crash later if needed.
+const CHANNELS = ["system:public"]; // change to ["system:public","crash:public"] if you want subscribe to crash
+const RECONNECT_FORCE_MS = 5 * 60 * 1000; // force reconnect every 5 min
+const BASE_BACKOFF_MS = 1000;
+const MAX_BACKOFF_MS = 5 * 60 * 1000;
 
-// Таблица: ws_events (см. SQL ниже)
-async function logEvent(event, source, payload = null) {
-  // минимальная запись — не падаем при ошибке
-  try {
-    await supabase.from("ws_events").insert({
-      event,
-      source,
-      payload: payload ? JSON.stringify(payload) : null,
-      created_at: new Date().toISOString()
-    });
-  } catch (e) {
-    // не делаем shutdown в случае ошибок логирования
-    console.warn("[LOG->DB ERR]", event, e?.message || e);
-  }
-  console.log(`[LOG] ${event} ${source}` + (payload ? ` ${JSON.stringify(payload)}` : ""));
-}
+let ws = null;
+let stopped = false;
+let attempt = 0;
+let periodicReconnectTimer = null;
+let backoffTimer = null;
 
-// token fetch
+// small helper logger (standardized)
+function log(...args){ console.log(new Date().toISOString(), ...args); }
+
+// fetch token helper
 async function getToken() {
   try {
     const r = await fetch("https://cs2run.app/current-state", { cache: "no-store" });
     const j = await r.json();
     return j?.data?.main?.centrifugeToken || null;
   } catch (e) {
-    console.warn("[TOKEN] fetch error", e?.message || e);
+    log("[TOKEN] fetch error", (e && e.message) ? e.message : e);
     return null;
   }
 }
 
-// State
-let ws = null;
-let stopped = false;
-let attempt = 0;
-let lastTransportPingTs = 0;
-let periodicReconnectTimer = null;
-let backoffTimer = null;
-
-// graceful shutdown support
-process.on("SIGINT", () => { console.log("SIGINT"); stopped = true; safeClose(); process.exit(0); });
-process.on("SIGTERM", () => { console.log("SIGTERM"); stopped = true; safeClose(); process.exit(0); });
-
-// safe close helper
-function safeClose() {
+function safeCloseSocket() {
   try {
-    if (ws && ws.readyState === ws.OPEN) ws.close();
-  } catch (e) {}
+    if (ws && ws.readyState === WebSocket.OPEN) ws.close();
+  } catch(e){}
 }
 
-// main connect function
+// start connection
 async function startClient() {
   if (stopped) return;
   const token = await getToken();
   if (!token) {
-    console.log("[START] token missing — retry in 3s");
-    return setTimeout(startClient, 3000);
+    log("[START] token missing — retry in 3s");
+    setTimeout(startClient, 3000);
+    return;
   }
 
-  const headers = {
-    "User-Agent": UA,
-    "Origin": ORIGIN
-  };
+  // Add UA/Origin headers to be closer to browser behaviour
+  const headers = { "Origin": ORIGIN, "User-Agent": UA };
 
-  // connect
-  console.log("[START] connecting...");
+  log("[START] connecting...", WS_URL);
   ws = new WebSocket(WS_URL, { headers });
 
-  // set small flags
+  // state for this connection
   let gotConnectAck = false;
-  let connectPending = true;
-  let forcedReconnectHandle = null;
+  let connectSent = false;
+  let lastTransportPingTs = 0;
 
-  // Helpers
+  // reset periodic reconnect
   function schedulePeriodicReconnect() {
     if (periodicReconnectTimer) clearTimeout(periodicReconnectTimer);
     periodicReconnectTimer = setTimeout(() => {
-      console.log("[AUTO] periodic force reconnect");
-      logEvent("force_reconnect", "client");
-      safeClose();
-    }, RECONNECT_INTERVAL_MS);
+      log("[AUTO] periodic force reconnect");
+      safeCloseSocket();
+    }, RECONNECT_FORCE_MS);
   }
 
   ws.once("open", () => {
-    attempt = 0; // reset backoff on success
-    console.log("[WS] OPEN");
-    logEvent("open", "client");
-
-    // Immediately send transport-level pong (helps some servers)
-    try {
-      ws.pong();
-      logEvent("transport_pong_sent", "client");
-    } catch (e) {
-      console.warn("[transport_pong_sent] error", e?.message || e);
-    }
-
-    // Send minimal CONNECT (variant B - minimal subs:{})
+    attempt = 0;
+    log("[WS] OPEN");
+    // do not send any pong proactively — wait for server ping (transport or json)
+    // send minimal connect (text JSON) like browser
     const connectMsg = { id: 1, connect: { token, subs: {} } };
-    ws.send(JSON.stringify(connectMsg));
-    logEvent("connect_sent", "client", { token_present: !!token });
+    try {
+      ws.send(JSON.stringify(connectMsg));
+      connectSent = true;
+      log("[LOG] connect_sent client", { token_present: !!token });
+    } catch (e) {
+      log("[ERR] send connect", e?.message || e);
+    }
 
     schedulePeriodicReconnect();
-
-    // watchdog: if transport pings stop being seen — schedule restart after a reasonable time
-    if (forcedReconnectHandle) clearTimeout(forcedReconnectHandle);
-    forcedReconnectHandle = setTimeout(function watch() {
-      const age = Date.now() - (lastTransportPingTs || 0);
-      // if very old and socket still open -> force restart
-      if (ws && ws.readyState === WebSocket.OPEN && age > 60_000 /* 60s */) {
-        console.log("[WATCHDOG] no transport ping seen for", age, "ms -> restart");
-        logEvent("watchdog_restart", "client", { age });
-        safeClose();
-      } else {
-        // reschedule watcher
-        forcedReconnectHandle = setTimeout(watch, 30_000);
-      }
-    }, 30_000);
   });
 
-  // transport-level ping -> respond with pong (binary)
+  // Transport-level ping handler — low-level binary ping
   ws.on("ping", (data) => {
     lastTransportPingTs = Date.now();
+    log("[TRANSPORT] ping received (low-level)");
     try {
+      // reply exactly with same data if present
       ws.pong(data);
-      logEvent("transport_pong_sent", "client");
-      console.log("[TRANSPORT] ping -> pong");
+      log("[TRANSPORT] pong sent (low-level)");
     } catch (e) {
-      console.warn("[TRANSPORT] pong error", e?.message || e);
+      log("[TRANSPORT] pong error", e?.message || e);
     }
   });
 
+  // Transport-level pong (when server replies to our pong or echo)
   ws.on("pong", (data) => {
     lastTransportPingTs = Date.now();
-    logEvent("transport_pong_rcv", "client");
-    console.log("[TRANSPORT] pong received");
+    log("[TRANSPORT] pong event received");
   });
 
   ws.on("message", (raw) => {
-    // raw is usually string JSON; if binary arrives, ignore for now
+    // raw might be string or Buffer
     let text = null;
-    try { text = String(raw); } catch { text = null; }
+    if (typeof raw === "string") text = raw;
+    else if (raw instanceof Buffer) {
+      // try to decode buffer as utf8 string - may be binary envelope
+      try { text = raw.toString("utf8"); }
+      catch { text = null; }
+    } else {
+      try { text = String(raw); } catch { text = null; }
+    }
 
     if (!text) {
-      // binary or non-text message — optionally record head
-      logEvent("binary_message_ignored", "server");
+      // binary that can't be decoded — just note it (debug only)
+      log("[MSG] binary frame (ignored in current build)");
       return;
     }
 
-    // parse JSON safely
+    // Try parse JSON
     let msg = null;
     try { msg = JSON.parse(text); } catch (e) {
       // not JSON — ignore
-      logEvent("nonjson_message_ignored", "server", { sample: text.slice(0,200) });
+      log("[MSG] non-json text (ignored)", text.slice(0,200));
       return;
     }
 
-    // If protocol sends an array of messages, iterate
+    // If array, iterate
     const arr = Array.isArray(msg) ? msg : [msg];
     for (const m of arr) {
-      // --- JSON-level ping (centrifugo) ---
+      // JSON-level ping from Centrifugo-like protocol
       if (m.ping !== undefined) {
-        logEvent("json_ping", "server", m.ping || {});
-        // reply JSON PONG — minimal
+        log("[JSON] ping <- server", m.ping || {});
+        // Reply JSON pong in the same format
         try {
           ws.send(JSON.stringify({ pong: {} }));
-          logEvent("json_pong_sent", "client");
+          log("[JSON] pong -> sent");
         } catch (e) {
-          console.warn("[json_pong_sent] error", e?.message || e);
+          log("[ERR] json pong send", e?.message || e);
         }
         continue;
       }
 
-      // --- CONNECT ACK variations ---
-      // server may reply: { id:1, connect: {...} } or { result: { connect: {...} }, id:1 }
+      // Connect ack (server may send {id:1, connect: {...}} or {result:..., id:1})
       if ((m.id === 1 && m.connect) || (m.id === 1 && m.result && m.result.connect)) {
-        // got connect ack
         if (!gotConnectAck) {
           gotConnectAck = true;
-          logEvent("connect_ack", "server", { client: (m.connect||m.result?.connect)?.client || null });
+          const clientId = (m.connect && m.connect.client) || (m.result?.connect?.client) || null;
+          log("[LOG] connect_ack server", { client: clientId });
 
-          // Immediately send JSON PONG (after connect ack), then subscribe
-          try {
-            ws.send(JSON.stringify({ pong: {} }));
-            logEvent("json_pong_sent", "client");
-          } catch (e) {
-            console.warn("[json_pong_sent] error", e?.message || e);
-          }
-
-          // Small delay before subscribe to mimic browser timing
+          // After connect ack: subscribe to channels (only system/channel B handled by server)
           setTimeout(() => {
             CHANNELS.forEach((ch, idx) => {
               try {
                 const sub = { id: 100 + idx, subscribe: { channel: ch } };
                 ws.send(JSON.stringify(sub));
-                logEvent("subscribe_sent", "client", { channel: ch, id: 100 + idx });
+                log("[LOG] subscribe_sent client", { channel: ch, id: 100 + idx });
               } catch (e) {
-                console.warn("[subscribe_sent] error", e?.message || e);
+                log("[ERR] subscribe send", e?.message || e);
               }
             });
-          }, 150);
+          }, 120); // slight delay to mimic browser timing
         }
         continue;
       }
 
-      // --- Subscribe ACKs ---
+      // Subscribe ACK
       if (m.id === 100 || m.id === 101) {
-        logEvent("sub_ok", "server", { id: m.id });
+        log("[LOG] sub_ok server", { id: m.id });
         continue;
       }
 
-      // --- push messages (игровые) ---
+      // Push messages (Игровые push) — intentionally ignore to avoid spam
       if (m.push) {
-        // intentionally IGNORE (variant B) — don't write payload to DB
-        // optional: count them for rate control or metrics (not stored)
-        // console.debug("[PUSH ignored]", m.push?.channel);
+        // We do NOT log push payloads in this build.
+        // If you want to see one example for debug, enable below line.
+        // log("[PUSH ignored] channel=", m.push.channel);
         continue;
       }
 
-      // --- other messages — keep minimal sample logged ---
-      logEvent("other_message", "server", { sample: JSON.stringify(m).slice(0,400) });
+      // Other (rare) messages — log small sample
+      try {
+        log("[MSG other] sample", JSON.stringify(m).slice(0,300));
+      } catch(e){}
     }
   });
 
   ws.on("close", (code, reason) => {
-    console.log("[CLOSE]", code, reason?.toString?.() || reason);
-    logEvent("close", "server", { code, reason: reason?.toString?.() || null });
-
-    // Clear periodic timers
+    log("[CLOSE]", code, reason?.toString?.() || reason);
+    // cleanup timers
     if (periodicReconnectTimer) { clearTimeout(periodicReconnectTimer); periodicReconnectTimer = null; }
-
     if (backoffTimer) { clearTimeout(backoffTimer); backoffTimer = null; }
 
-    // start reconnect with backoff
+    // reconnect with backoff
     attempt++;
     const backoff = Math.min(MAX_BACKOFF_MS, BASE_BACKOFF_MS * Math.pow(2, Math.min(10, attempt)));
-    console.log(`[RECONNECT] attempt=${attempt} backoff=${backoff}ms`);
+    log(`[RECONNECT] attempt=${attempt} backoff=${backoff}ms`);
     backoffTimer = setTimeout(() => {
       startClient();
     }, backoff);
   });
 
   ws.on("error", (err) => {
-    console.warn("[WS ERROR]", err?.message || err);
-    logEvent("error", "client", { msg: String(err?.message || err) });
-
-    // close to trigger reconnect path
-    try { ws.close(); } catch (e) {}
+    log("[WS ERROR]", (err && err.message) ? err.message : err);
+    // force close to trigger reconnect path
+    try { if (ws) ws.close(); } catch(e){}
   });
+
+  // watchdog: if no transport ping seen in 90s while socket open, force reconnect
+  (function startWatchdog(){
+    const id = setInterval(() => {
+      if (!ws) return clearInterval(id);
+      if (ws.readyState !== WebSocket.OPEN) return;
+      const last = lastTransportPingTs || 0;
+      const age = Date.now() - last;
+      if (last !== 0 && age > 90_000) {
+        log("[WATCHDOG] last transport ping age ms:", age, " — forcing reconnect");
+        safeCloseSocket();
+      }
+    }, 30_000);
+  })();
 }
 
-// start main
+// start
 startClient().catch(err => {
   console.error("[FATAL]", err);
   process.exit(1);
+});
+
+// graceful shutdown
+process.on("SIGINT", () => {
+  log("SIGINT — shutting down");
+  stopped = true;
+  safeCloseSocket();
+  setTimeout(() => process.exit(0), 500);
+});
+process.on("SIGTERM", () => {
+  log("SIGTERM — shutting down");
+  stopped = true;
+  safeCloseSocket();
+  setTimeout(() => process.exit(0), 500);
 });
