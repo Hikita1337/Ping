@@ -1,0 +1,13 @@
+{
+  "name": "cs2run-ws-client",
+  "version": "1.0.0",
+  "description": "Stable CS2Run WebSocket client with binary pong and latency logging",
+  "type": "module",
+  "dependencies": {
+    "ws": "^8.14.2",
+    "node-fetch": "^3.3.2"
+  },
+  "scripts": {
+    "start": "node server.js"
+  }
+}
