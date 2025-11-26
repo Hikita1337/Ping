@@ -1,146 +1,189 @@
 import WebSocket from "ws";
-import http from "http";
 import fetch from "node-fetch";
+import express from "express";
 
-// Конфиг
+// CONFIG
 const WS_URL = "wss://ws.cs2run.app/connection/websocket";
-const CHANNEL = "csgorun:crash";
-const PORT = 10000;
 const TOKEN_URL = "https://cs2run.app/current-state";
+const CHANNEL = "csgorun:crash";
 
-// Логи в памяти
-const logs = [];
-const MAX_LOGS = 2000;
+const PONG_WAIT_MS = 26000; // отправляем pong только после ping
+const HEARTBEAT_INTERVAL = 5 * 60 * 1000; // каждые 5 минут
+const MAX_LOG = 2000;
 
-// Данные текущей сессии
-let sessionStart = null;
-let lastPong = null;
+// STATE
 let ws = null;
+let logs = [];
+let sessionStartTs = null;
+let lastPongTs = null;
+let pongTimer = null;
+let sessionActiveLogger = null;
 
-// Логирование
-function addLog(event, extra = {}) {
-  const entry = {
-    ts: new Date().toISOString(),
-    event,
-    ...extra
-  };
-  logs.push(entry);
-  if (logs.length > MAX_LOGS) logs.shift();
-  console.log(`[${event}]`, extra);
+function addLog(obj) {
+  obj.ts = new Date().toISOString();
+  logs.push(obj);
+  if (logs.length > MAX_LOG) logs.shift();
 }
 
-// Получение guest-токена
-async function fetchToken() {
-  addLog("token_fetch");
+function sessionDuration() {
+  if (!sessionStartTs) return 0;
+  return Date.now() - sessionStartTs;
+}
+
+function human(ms) {
+  const s = Math.floor(ms / 1000);
+  return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m ${s % 60}s`;
+}
+
+async function getToken() {
   try {
-    const res = await fetch(TOKEN_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: "{}"
-    });
-    const json = await res.json();
-    return json?.data?.token;
-  } catch (e) {
-    addLog("token_error", { error: e.message });
+    const r = await fetch(TOKEN_URL, { cache: "no-store" });
+    const j = await r.json();
+    return j?.data?.main?.centrifugeToken || null;
+  } catch {
     return null;
   }
 }
 
-// Подключение к WebSocket
-async function connectWS() {
-  const token = await fetchToken();
-  if (!token) return setTimeout(connectWS, 5000);
+async function connectWs() {
+  const token = await getToken();
+  if (!token) {
+    addLog({ event: "token_missing" });
+    console.log("[TOKEN] missing — retry in 3s");
+    setTimeout(connectWs, 3000);
+    return;
+  }
 
-  addLog("start_connect", { ws_url: WS_URL, channel: CHANNEL });
+  console.log("[RUN] connecting...");
+  addLog({ event: "start_connect", channel: CHANNEL });
 
-  ws = new WebSocket(WS_URL, {
-    headers: {
-      "Authorization": `Bearer ${token}`
+  ws = new WebSocket(WS_URL);
+
+  ws.on("open", () => {
+    sessionStartTs = Date.now();
+    lastPongTs = Date.now();
+
+    console.log("[WS] OPEN");
+    addLog({ event: "ws_open" });
+
+    ws.send(
+      JSON.stringify({
+        id: 1,
+        connect: { token }
+      })
+    );
+
+    setTimeout(() => {
+      ws.send(JSON.stringify({ id: 100, subscribe: { channel: CHANNEL } }));
+      addLog({ event: "subscribe_sent", channel: CHANNEL });
+      console.log("[WS->] subscribe", CHANNEL);
+    }, 250);
+  });
+
+  ws.on("message", (data) => {
+    try {
+      const msg = JSON.parse(data.toString("utf8"));
+
+      if (msg?.connect?.ping === 25) {
+        console.log("[WS] CONNECT ACK");
+        addLog({ event: "connect_ack" });
+        return;
+      }
+
+      // Игровой спам игнорируем полностью
+      if (msg?.publ?.data) {
+        return;
+      }
+
+      console.log("[WS MSG]", msg);
+      addLog({ event: "msg", msg });
+    } catch {
+      addLog({ event: "msg_bin", size: data.length });
     }
   });
 
-  ws.on("open", () => {
-    sessionStart = Date.now();
-    lastPong = Date.now();
-    addLog("ws_open");
+  ws.on("ping", () => {
+    console.log("[PING] <- server");
+    addLog({ event: "ping_recv" });
 
-    // CONNECT
-    ws.send(JSON.stringify({
-      id: 1,
-      connect: { version: "6.3.1 OSS" }
-    }));
-
-    // SUBSCRIBE
-    ws.send(JSON.stringify({
-      id: 100,
-      subscribe: CHANNEL
-    }));
-  });
-
-  ws.on("message", (raw) => {
     try {
-      const msg = JSON.parse(raw);
+      ws.pong();
+      lastPongTs = Date.now();
+      addLog({ event: "pong_sent" });
+      console.log("[PONG] -> sent");
+    } catch {
+      addLog({ event: "pong_err" });
+    }
 
-      if (Object.keys(msg).length === 0) {
-        lastPong = Date.now();
-        addLog("pong_recv");
-        ws.send(JSON.stringify({ type: 3 }));
-        return;
-      }
-
-      if (msg.error) {
-        addLog("error", msg.error);
-        return;
-      }
-
-      if (msg.push || msg.result) return;
-
-      addLog("msg", msg);
-
-    } catch {}
+    if (pongTimer) clearTimeout(pongTimer);
+    pongTimer = setTimeout(() => {
+      console.log("[TIMEOUT] No PING — close");
+      ws.close();
+    }, PONG_WAIT_MS + 5000);
   });
 
   ws.on("close", (code, reason) => {
-    const durationMs = sessionStart ? Date.now() - sessionStart : 0;
-    addLog("ws_close", {
+    const dur = sessionDuration();
+    console.log(`[WS] CLOSE ${code} after ${dur}ms`);
+    addLog({
+      event: "ws_close",
       code,
       reason: reason?.toString(),
-      duration_ms: durationMs,
-      duration_human: `${Math.round(durationMs / 1000)}s`
+      duration_ms: dur,
+      duration_human: human(dur)
     });
-    setTimeout(connectWS, 3000);
+
+    resetHeartbeat();
+    setTimeout(connectWs, 2000);
   });
 
-  ws.on("error", err => {
-    addLog("ws_error", { error: err.toString() });
+  ws.on("error", (err) => {
+    console.log("[WS ERROR]", err.message);
+    addLog({ event: "ws_error", error: err.message });
   });
+
+  startHeartbeat();
 }
 
-// HTTP-сервер
-const server = http.createServer((req, res) => {
-  if (req.url === "/logs") {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    return res.end(JSON.stringify({
-      count: logs.length,
-      logs
-    }, null, 2));
-  }
+function startHeartbeat() {
+  if (sessionActiveLogger) clearInterval(sessionActiveLogger);
+  sessionActiveLogger = setInterval(() => {
+    if (!sessionStartTs) return;
+    console.log(
+      `[HEARTBEAT] session live: ${human(sessionDuration())}, last pong=${new Date(
+        lastPongTs
+      ).toISOString()}`
+    );
+    addLog({ event: "heartbeat", duration_ms: sessionDuration() });
+  }, HEARTBEAT_INTERVAL);
+}
 
-  if (req.url === "/status") {
-    const duration = sessionStart ? Math.floor((Date.now() - sessionStart) / 1000) : 0;
-    res.writeHead(200, { "Content-Type": "application/json" });
-    return res.end(JSON.stringify({
-      connected: ws?.readyState === WebSocket.OPEN,
-      session_seconds: duration,
-      last_pong_seconds_ago: lastPong ? Math.floor((Date.now() - lastPong) / 1000) : null
-    }, null, 2));
-  }
+function resetHeartbeat() {
+  sessionStartTs = null;
+  if (sessionActiveLogger) clearInterval(sessionActiveLogger);
+  sessionActiveLogger = null;
+  if (pongTimer) clearTimeout(pongTimer);
+}
 
-  res.writeHead(200, { "Content-Type": "text/plain" });
-  res.end("WS Monitor OK");
+// HTTP ENDPOINTS
+const app = express();
+
+app.get("/", (req, res) => res.send("ok"));
+
+app.get("/status", (req, res) => {
+  res.json({
+    connected: ws?.readyState === WebSocket.OPEN,
+    duration_ms: sessionDuration(),
+    duration_human: human(sessionDuration()),
+    last_pong: lastPongTs ? new Date(lastPongTs).toISOString() : null,
+    log_entries: logs.length
+  });
 });
 
-server.listen(PORT, () => {
-  addLog("http_listen", { port: PORT });
-  connectWS();
+app.get("/logs", (req, res) => {
+  res.json({ count: logs.length, tail: logs });
 });
+
+app.listen(10000, () => console.log("[HTTP] listening 10000"));
+
+connectWs();
