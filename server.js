@@ -41,9 +41,9 @@ async function startWS() {
     log("[WS] OPEN");
 
     ws.send(JSON.stringify({
-      id: 1,
-      connect: { token }
-    }));
+  id: 1,
+  connect: { token, subs: {} }
+}));
     log("[CONNECT] sent");
 
     setTimeout(() => {
