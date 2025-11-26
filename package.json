@@ -1,12 +1,13 @@
 {
-  "name": "cs2run-browser-proxy",
+  "name": "ws-sniffer",
   "version": "1.0.0",
+  "main": "server.js",
   "type": "module",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "puppeteer": "^22.0.0",
-    "ws": "^8.18.0"
+    "@supabase/supabase-js": "^2.39.0",
+    "puppeteer": "^23.4.0"
   }
 }
