@@ -9,7 +9,7 @@ import path from "path";
 
 const WS_URL = process.env.WS_URL || "wss://ws.cs2run.app/connection/websocket";
 const TOKEN_URL = process.env.TOKEN_URL || "https://cs2run.app/current-state";
-const CHANNEL = process.env.CHANNEL || "public:status"; // тихий публичный канал
+const CHANNEL = process.env.CHANNEL || "public:main"; // тихий публичный канал
 const PORT = Number(process.env.PORT || 8080);
 
 // behavior tuning
