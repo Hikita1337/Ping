@@ -82,16 +82,26 @@ async function startWS() {
     }
   });
 
-  ws.on("message", raw => {
-    try {
-      const j = JSON.parse(raw);
-      if (j.push) return;
-      if (j.ping) return;
-      console.log("[MSG JSON]", j);
-    } catch {
-      console.log("[MSG TEXT]", raw.toString());
+ws.on("message", raw => {
+  try {
+    const j = JSON.parse(raw);
+
+    // ЦЕНТРАЛЬНАЯ СТРОКА:
+    // Игровые push'и > больше не логируем
+    if (j.push) return; 
+
+    if (j.ping) return;
+    if (j.result && j.id === 1) {
+      console.log("[WS] CONNECTED ACK");
+      return;
     }
-  });
+
+    // Всё полезное оставляем
+    console.log("[MSG JSON]", j);
+  } catch {
+    console.log("[MSG TEXT]", raw.toString());
+  }
+});
 
   ws.on("close", (code, reason) => {
     console.log(`[WS] CLOSE ${code} ${reason?.toString()}`);
