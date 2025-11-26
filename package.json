@@ -1,10 +1,12 @@
 {
+  "name": "cs2run-browser-proxy",
+  "version": "1.0.0",
   "type": "module",
-  "dependencies": {
-    "ws": "^8.14.2",
-    "node-fetch": "^3.3.2"
-  },
   "scripts": {
     "start": "node server.js"
+  },
+  "dependencies": {
+    "puppeteer": "^22.0.0",
+    "ws": "^8.18.0"
   }
 }
