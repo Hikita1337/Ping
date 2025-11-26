@@ -1,6 +1,6 @@
 {
-  "name": "ws-sniffer",
-  "version": "4.0.0",
+  "name": "ws-sniffer-stable",
+  "version": "4.2.0",
   "type": "module",
   "scripts": {
     "start": "node server.js"
