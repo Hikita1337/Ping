@@ -1,97 +1,110 @@
-import chromium from "@sparticuz/chromium";
-import puppeteer from "puppeteer-core";
-import { createClient } from "@supabase/supabase-js";
+import WebSocket from "ws";
+import fetch from "node-fetch";
+import pkg from "@supabase/supabase-js";
+const { createClient } = pkg;
 
-process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+const SUPABASE_URL = "https://pdsuiqmddqsllarznceh.supabase.co";
+const SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBkc3VpcW1kZHFzbGxhcnpuY2VoIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2MTc4MjM5MywiZXhwIjoyMDc3MzU4MzkzfQ.oz3-A6R7V7FM2ZKyTV1BrMEhrZKvTherL9sCyCteIXE";
 
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_KEY = process.env.SUPABASE_KEY;
-const supa = createClient(SUPABASE_URL, SUPABASE_KEY);
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
-const TARGET = "https://csgoyz.run/crash";
+const WS_URL = "wss://ws.cs2run.app/connection/websocket";
+const CHANNELS = ["csgorun:crash", "csgorun:main"];
 
-const UA =
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15";
+let ws;
 
-async function run() {
-  console.log("[LAUNCH] Chromium starting...");
-
-  const browser = await puppeteer.launch({
-    args: [
-      ...chromium.args,
-      "--no-sandbox",
-      "--disable-dev-shm-usage",
-      "--disable-web-security",
-      "--disable-features=IsolateOrigins,site-per-process",
-      "--user-agent=" + UA
-    ],
-    headless: chromium.headless,
-    executablePath: await chromium.executablePath(),
-    defaultViewport: {
-      width: 1600,
-      height: 900
-    }
+async function logEvent(event, source, payload = null) {
+  await supabase.from("ws_events").insert({
+    event,
+    source,
+    payload
   });
-
-  const page = await browser.newPage();
-  await page.setUserAgent(UA);
-
-  const client = await page.target().createCDPSession();
-  await client.send("Network.enable");
-
-  let wsSeen = false;
-
-  client.on("Network.webSocketCreated", async (ev) => {
-    wsSeen = true;
-    console.log("[WS] CREATED:", ev.url);
-
-    await supa.from("ws_logs").insert({
-      direction: "meta",
-      body: "WS_CREATED: " + ev.url,
-      ts: new Date().toISOString()
-    });
-  });
-
-  client.on("Network.webSocketFrameReceived", async ({ response }) => {
-    await supa.from("ws_logs").insert({
-      direction: "recv",
-      body: response.payloadData,
-      ts: new Date().toISOString()
-    });
-  });
-
-  client.on("Network.webSocketFrameSent", async ({ response }) => {
-    await supa.from("ws_logs").insert({
-      direction: "send",
-      body: response.payloadData,
-      ts: new Date().toISOString()
-    });
-  });
-
-  console.log("[NAVIGATE] →", TARGET);
-
-  try {
-    await page.goto(TARGET, { waitUntil: "domcontentloaded", timeout: 60_000 });
-  } catch (err) {
-    console.log("[WARN] Navigation didn’t fully complete:", err.message);
-  }
-
-  console.log("[WAIT] First WS or timeout…");
-
-  const start = Date.now();
-  while (!wsSeen && Date.now() - start < 80_000) {
-    await new Promise(r => setTimeout(r, 300));
-  }
-
-  if (!wsSeen) {
-    console.log("[FAIL] No WebSocket in 80s → EXIT");
-    process.exit(1);
-  }
-
-  console.log("[OK] WebSocket detected. Sniffing started.");
+  console.log(`[LOG->DB] ${event}`);
 }
 
-run().catch(err => {
-  console.error("FAIL:", err);
-  process.exit(1);
-});
+async function getToken() {
+  console.log("[INFO] Fetching token...");
+  try {
+    const r = await fetch("https://cs2run.app/current-state", {
+      cache: "no-store",
+    });
+    const j = await r.json();
+    const token = j?.data?.main?.centrifugeToken;
+    console.log("[INFO] Token:", token ? "FOUND" : "NOT FOUND");
+    return token;
+  } catch {
+    return null;
+  }
+}
+
+async function start() {
+  const token = await getToken();
+  if (!token) {
+    setTimeout(start, 3000);
+    return;
+  }
+
+  ws = new WebSocket(WS_URL);
+
+  ws.on("open", () => {
+    console.log("[WS] OPEN");
+    logEvent("open", "client");
+
+    ws.send(JSON.stringify({
+      id: 1,
+      connect: { token, subs: {} }
+    }));
+    logEvent("connect_sent", "client");
+
+    setTimeout(() => {
+      CHANNELS.forEach((ch, i) => {
+        ws.send(JSON.stringify({
+          id: 100 + i,
+          subscribe: { channel: ch }
+        }));
+        logEvent("subscribe_sent", "client", { ch });
+      });
+    }, 200);
+  });
+
+  ws.on("message", raw => {
+    let msg;
+    try { msg = JSON.parse(raw); } catch { return; }
+
+    const arr = Array.isArray(msg) ? msg : [msg];
+
+    arr.forEach(m => {
+
+      if (m.ping !== undefined) {
+        logEvent("ping", "server");
+        ws.send(JSON.stringify({ pong: {} }));
+        logEvent("pong", "client");
+        return;
+      }
+
+      if (m.id === 1 && m.result) {
+        logEvent("connect_ok", "server");
+        return;
+      }
+
+      if (m.id === 100 || m.id === 101) {
+        logEvent("sub_ok", "server", { id: m.id });
+        return;
+      }
+    });
+  });
+
+  ws.on("close", (code, reason) => {
+    console.log("[CLOSE]", code, reason?.toString());
+    logEvent("close", "server", { code, reason });
+
+    setTimeout(start, 2000);
+  });
+
+  ws.on("error", err => {
+    console.log("[ERR]", err.message);
+    logEvent("error", "client", { msg: err.message });
+  });
+}
+
+start();
