@@ -1,5 +1,6 @@
-const WebSocket = require("ws");
-const http = require("http");
+import WebSocket from "ws";
+import http from "http";
+import fetch from "node-fetch";
 
 // Конфиг
 const WS_URL = "wss://ws.cs2run.app/connection/websocket";
@@ -16,21 +17,19 @@ let sessionStart = null;
 let lastPong = null;
 let ws = null;
 
-// Функция логирования
+// Логирование
 function addLog(event, extra = {}) {
   const entry = {
     ts: new Date().toISOString(),
     event,
     ...extra
   };
-
   logs.push(entry);
   if (logs.length > MAX_LOGS) logs.shift();
-
   console.log(`[${event}]`, extra);
 }
 
-// Получение guest токена
+// Получение guest-токена
 async function fetchToken() {
   addLog("token_fetch");
   try {
@@ -47,7 +46,7 @@ async function fetchToken() {
   }
 }
 
-// Подключение WebSocket
+// Подключение к WebSocket
 async function connectWS() {
   const token = await fetchToken();
   if (!token) return setTimeout(connectWS, 5000);
@@ -65,11 +64,13 @@ async function connectWS() {
     lastPong = Date.now();
     addLog("ws_open");
 
+    // CONNECT
     ws.send(JSON.stringify({
       id: 1,
       connect: { version: "6.3.1 OSS" }
     }));
 
+    // SUBSCRIBE
     ws.send(JSON.stringify({
       id: 100,
       subscribe: CHANNEL
@@ -80,12 +81,10 @@ async function connectWS() {
     try {
       const msg = JSON.parse(raw);
 
-      // ПИНГ сервера приходит в виде пустого {}
       if (Object.keys(msg).length === 0) {
         lastPong = Date.now();
         addLog("pong_recv");
-
-        ws.send(JSON.stringify({ type: 3 })); // PONG клиентский
+        ws.send(JSON.stringify({ type: 3 }));
         return;
       }
 
@@ -94,12 +93,10 @@ async function connectWS() {
         return;
       }
 
-      // Игнорируем PUSH от краш-канала
-      if (msg.result || msg.push) {
-        return;
-      }
+      if (msg.push || msg.result) return;
 
       addLog("msg", msg);
+
     } catch {}
   });
 
@@ -111,7 +108,6 @@ async function connectWS() {
       duration_ms: durationMs,
       duration_human: `${Math.round(durationMs / 1000)}s`
     });
-
     setTimeout(connectWS, 3000);
   });
 
@@ -120,11 +116,14 @@ async function connectWS() {
   });
 }
 
-// HTTP endpoints
+// HTTP-сервер
 const server = http.createServer((req, res) => {
   if (req.url === "/logs") {
     res.writeHead(200, { "Content-Type": "application/json" });
-    return res.end(JSON.stringify({ count: logs.length, logs }, null, 2));
+    return res.end(JSON.stringify({
+      count: logs.length,
+      logs
+    }, null, 2));
   }
 
   if (req.url === "/status") {
