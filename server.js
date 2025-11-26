@@ -1,130 +1,65 @@
-// server.js — стабильный Centrifugo WebSocket клиент
-import WebSocket from "ws";
-import fetch from "node-fetch";
+import puppeteer from "puppeteer";
+import { createClient } from "@supabase/supabase-js";
 
-const WS_URL = "wss://ws.cs2run.app/connection/websocket";
-const CHANNELS = ["csgorun:crash", "csgorun:main"];
-const FORCE_RECONNECT_MS = 5 * 60 * 1000; // 5 минут
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_KEY = process.env.SUPABASE_KEY;
+const TARGET_URL = process.env.TARGET_URL;
 
-let ws;
-let lastPingTs = null;
-let reconnectTimer;
-
-function log(...a) {
-  console.log("[INFO]", ...a);
+if (!SUPABASE_URL || !SUPABASE_KEY || !TARGET_URL) {
+  console.error("Missing env vars");
+  process.exit(1);
 }
 
-async function fetchToken() {
-  log("Fetching token...");
-  try {
-    const r = await fetch("https://cs2run.app/current-state", {
-      cache: "no-store"
+const sb = createClient(SUPABASE_URL, SUPABASE_KEY);
+
+async function logWS(direction, payload, event_type, ws_channel = null) {
+  await sb.from("ws_logs").insert([
+    { direction, payload, event_type, ws_channel }
+  ]);
+}
+
+async function run() {
+  console.log("[LAUNCH] Chromium starting...");
+
+  const browser = await puppeteer.launch({
+    headless: true,
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox"
+    ]
+  });
+
+  const page = await browser.newPage();
+  console.log("[OPEN] Navigating to:", TARGET_URL);
+
+  await page.goto(TARGET_URL, { waitUntil: "networkidle2" });
+
+  console.log("[HOOK] Attaching WebSocket listeners...");
+
+  page.on("websocketcreated", ws => {
+    console.log("[WS] New socket →", ws.url());
+
+    ws.on("framereceived", async frame => {
+      await logWS(
+        "recv",
+        frame.payload,
+        "message"
+      );
     });
-    const j = await r.json();
-    const token = j?.data?.main?.centrifugeToken;
-    log(`Token: ${token ? "FOUND" : "NOT FOUND"}`);
-    return token;
-  } catch (err) {
-    log("Token fetch error:", err.message);
-    return null;
-  }
+
+    ws.on("framesent", async frame => {
+      await logWS(
+        "send",
+        frame.payload,
+        "message"
+      );
+    });
+  });
+
+  console.log("[RUN] Monitoring Traffic...");
+
+  // Работать бесконечно
+  setInterval(() => {}, 60 * 1000);
 }
 
-async function startWS() {
-  const token = await fetchToken();
-  if (!token) {
-    log("Retry in 3s...");
-    return setTimeout(startWS, 3000);
-  }
-
-  log(`Connecting to ${WS_URL}...`);
-  ws = new WebSocket(WS_URL, {
-    headers: {
-      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-      "Origin": "https://csgoyz.run",
-      "Sec-WebSocket-Protocol": "centrifugo.v2.json"
-    }
-  });
-
-  ws.on("open", () => {
-    log("[WS] OPEN");
-
-    ws.send(JSON.stringify({
-      id: 1,
-      connect: { token, subs: {} }
-    }));
-    log("[CONNECT] sent");
-
-    setTimeout(() => {
-      CHANNELS.forEach((ch, i) => {
-        ws.send(JSON.stringify({
-          id: 100 + i,
-          subscribe: { channel: ch }
-        }));
-        log(`[SUB] -> ${ch}`);
-      });
-    }, 200);
-
-    if (reconnectTimer) clearTimeout(reconnectTimer);
-    reconnectTimer = setTimeout(() => {
-      log("[RECONNECT] timeout reached → reconnect");
-      safeClose();
-    }, FORCE_RECONNECT_MS);
-  });
-
-  ws.on("message", raw => {
-    let msg;
-    try { msg = JSON.parse(raw); }
-    catch { return; }
-
-    const arr = Array.isArray(msg) ? msg : [msg];
-
-    for (const m of arr) {
-      // Server PING (важная часть!)
-      if (m.ping !== undefined) {
-        lastPingTs = Date.now();
-        log("[PING] <-", JSON.stringify(m));
-        ws.send(JSON.stringify({ pong: {} }));
-        log("[PONG] -> {}");
-        continue;
-      }
-
-      if (m.result && m.id === 1) {
-        log("[ACK] CONNECT OK");
-        continue;
-      }
-
-      if (m.id === 100 || m.id === 101) {
-        log(`[ACK] SUB OK id=${m.id}`);
-        continue;
-      }
-
-      if (m.push) continue; // фильтр игрового спама
-
-      log("[MSG]", m);
-    }
-  });
-
-  ws.on("close", (code, reason) => {
-    log(`[CLOSE] code=${code} reason=${reason || "(none)"}`);
-    restart("close");
-  });
-
-  ws.on("error", err => {
-    log("[ERROR]", err.message);
-    restart("error");
-  });
-}
-
-function restart(cause) {
-  log(`[RESTART] cause=${cause}`);
-  setTimeout(startWS, 2000);
-}
-
-function safeClose() {
-  if (ws && ws.readyState === ws.OPEN) {
-    try { ws.close(); } catch {}
-  }
-}
-
-startWS();
+run().catch(err => console.error("FAIL:", err));
