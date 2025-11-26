@@ -1,13 +1,13 @@
 {
   "name": "ws-sniffer",
-  "version": "1.0.0",
-  "main": "server.js",
+  "version": "3.0.0",
   "type": "module",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.39.0",
-    "puppeteer": "^23.4.0"
+    "@supabase/supabase-js": "^2.43.4",
+    "@sparticuz/chromium": "^129.0.0",
+    "puppeteer-core": "^23.4.1"
   }
 }
