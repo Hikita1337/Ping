@@ -1,20 +1,5 @@
-/**
- * ws-sniffer-stable v4.8.0
- * Purpose: exhaustive binary/text ws sniffer + experimental raw-pong responder
- *
- * Usage:
- *   - set env vars as needed (see config section below)
- *   - npm install
- *   - node server.js
- *
- * Notes:
- *   - Этот код делает множественные попытки ответов pong'ом:
- *       1) ws.pong(raw) (transport-level)
- *       2) send(JSON.stringify({type:3}))
- *       3) send(rawBuffer derived from last incoming frame with conservative replacement)
- *   - Не обещаю 100% успеха против систем со сложной криптографической подпиской/шифрованием.
- */
-
+// server.js — WS sniffer (Mode A: full raw wire dump)
+// ES module style (node >= 18 / 20 / 22)
 import WebSocket from "ws";
 import fetch from "node-fetch";
 import fs from "fs";
@@ -23,373 +8,233 @@ import os from "os";
 import express from "express";
 
 const WS_URL = process.env.WS_URL || "wss://ws.cs2run.app/connection/websocket";
-const CHANNELS = (process.env.CHANNELS && process.env.CHANNELS.split(",")) || ["csgorun:crash", "csgorun:main"];
-const DUMP_DIR = process.env.DUMP_DIR || "./dumps";
-const MAX_STORED_FRAMES = Number(process.env.MAX_FRAMES || 200); // circular buffer
-const LOG_SAMPLE_BYTES = Number(process.env.SAMPLE_BYTES || 256); // how many bytes to include in hex/base64 samples
-const IGNORE_PUSH = (process.env.IGNORE_PUSH || "true") === "true"; // don't log game pushes by default
-const RECONNECT_BASE_MS = Number(process.env.RECONNECT_BASE_MS || 2000);
-const RECONNECT_MAX_MS = Number(process.env.RECONNECT_MAX_MS || 60000);
+const CHANNELS = (process.env.CHANNELS || "csgorun:crash,csgorun:main").split(",");
+const TOKEN_URL = process.env.TOKEN_URL || "https://cs2run.app/current-state";
 
-if (!fs.existsSync(DUMP_DIR)) fs.mkdirSync(DUMP_DIR, { recursive: true });
-
-function nowISO(){ return new Date().toISOString(); }
-function hex(buf){ return Buffer.from(buf).toString('hex'); }
-function b64(buf){ return Buffer.from(buf).toString('base64'); }
+const RECONNECT_BASE_MS = 2000;
+const MAX_LOG_ENTRIES = Number(process.env.MAX_LOG_ENTRIES) || 20000;
+const DUMP_INTERVAL_MS = Number(process.env.DUMP_INTERVAL_MS) || 120000; // 2 min
+const STARTUP_LOG_TO_FILE = process.env.STARTUP_LOG_TO_FILE === "1" || false;
 
 let ws = null;
-let reconnectDelay = RECONNECT_BASE_MS;
-let lastFrames = []; // circular store { ts, raw, totalSize, hex_sample, base64_sample, parsedJSON? }
-let currentLogStream = null;
-let pongTimer = null;
-let nextPongMs = null;
-let clientTokenCache = null;
+let running = true;
+let reconnectAttempts = 0;
+let logs = []; // circular buffer of events
 
-function openLogStream(){
-  const file = path.join(DUMP_DIR, `ws-log-${new Date().toISOString().replace(/[:.]/g,'-')}.ndjson`);
-  currentLogStream = fs.createWriteStream(file, { flags: 'a' });
-  console.log(nowISO(), "[LOG->FILE] open", file);
-  writeLog({ event: "start", ts: nowISO(), wsUrl: WS_URL, channels: CHANNELS });
+function pushLog(obj) {
+  obj.ts = new Date().toISOString();
+  logs.push(obj);
+  if (logs.length > MAX_LOG_ENTRIES) logs.splice(0, logs.length - MAX_LOG_ENTRIES);
 }
 
-function writeLog(obj){
+function hex(buf) {
+  if (!Buffer.isBuffer(buf)) buf = Buffer.from(String(buf));
+  return buf.toString("hex");
+}
+function b64(buf) {
+  if (!Buffer.isBuffer(buf)) buf = Buffer.from(String(buf));
+  return buf.toString("base64");
+}
+
+async function fetchToken() {
   try {
-    if (!currentLogStream) openLogStream();
-    const line = JSON.stringify(Object.assign({ ts: nowISO() }, obj));
-    currentLogStream.write(line + os.EOL);
-  } catch (e) { console.error(nowISO(), "[ERR] writeLog", e && e.message); }
-}
-
-function pushFrame(rawBuf){
-  const totalSize = rawBuf.length;
-  const dumpBytes = Math.min(LOG_SAMPLE_BYTES, totalSize);
-  const sampleBuf = rawBuf.slice(0, dumpBytes);
-  const entry = {
-    ts: Date.now(),
-    totalSize,
-    truncated: dumpBytes < totalSize,
-    dumpBytes,
-    hex_sample: sampleBuf.toString('hex'),
-    base64_sample: sampleBuf.toString('base64'),
-    raw: rawBuf // keep buffer in memory for potential replay; careful about memory: limited by MAX_STORED_FRAMES
-  };
-  lastFrames.push(entry);
-  if (lastFrames.length > MAX_STORED_FRAMES) lastFrames.shift();
-  // write log without raw buffer (too big) — keep samples
-  const entryForLog = Object.assign({}, entry);
-  delete entryForLog.raw;
-  writeLog({ event: "frame_in", frame: entryForLog });
-  return entry;
-}
-
-async function fetchToken(){
-  // Try cache first (short-lived)
-  if (clientTokenCache && (Date.now() - clientTokenCache._fetchedAt) < 30_000) return clientTokenCache.token;
-  try {
-    const r = await fetch("https://cs2run.app/current-state", { cache: "no-store" });
+    const r = await fetch(TOKEN_URL, { cache: "no-store", timeout: 5000 });
     const j = await r.json();
-    const token = j?.data?.main?.centrifugeToken || null;
-    clientTokenCache = { token, _fetchedAt: Date.now() };
-    console.log(nowISO(), "[INFO] token fetched status:", token ? "FOUND" : "MISSING");
-    return token;
-  } catch (e){
-    console.error(nowISO(), "[ERR] fetchToken", e && e.message);
+    const token = j?.data?.main?.centrifugeToken;
+    pushLog({ type: "token_fetch", ok: !!token });
+    return token || null;
+  } catch (e) {
+    pushLog({ type: "token_fetch_error", error: String(e) });
     return null;
   }
 }
 
-function schedulePongInterval(intervalMs){
-  if (pongTimer) clearTimeout(pongTimer);
-  nextPongMs = intervalMs;
-  pongTimer = setTimeout(() => {
+function safeParseJsonMaybe(buf) {
+  try {
+    const txt = Buffer.isBuffer(buf) ? buf.toString("utf8") : String(buf);
+    return JSON.parse(txt);
+  } catch (e) {
+    return null;
+  }
+}
+
+function dumpLogsToFile() {
+  try {
+    if (!logs.length) return;
+    const fn = path.join(os.tmpdir(), `ws_dump_${Date.now()}.json`);
+    fs.writeFileSync(fn, JSON.stringify({ exportedAt: new Date().toISOString(), logs }, null, 2));
+    console.log("[DUMP] saved logs ->", fn, `(${logs.length} entries)`);
+    pushLog({ type: "dump_saved", file: fn, entries: logs.length });
+    // keep logs in memory; caller can pick up files from Render logs/artifacts if needed
+  } catch (e) {
+    console.error("[DUMP ERR]", e);
+  }
+}
+
+function attachWsHandlers(wsInstance) {
+  wsInstance.on("open", () => {
+    reconnectAttempts = 0;
+    pushLog({ type: "ws_open", url: WS_URL });
+    console.log("[WS] OPEN");
+  });
+
+  // 'message' receives Buffer or string. We'll log raw bytes + try JSON parse.
+  wsInstance.on("message", (data, isBinary) => {
+    const entry = {
+      type: "message",
+      isBinary: !!isBinary,
+      size: Buffer.isBuffer(data) ? data.length : String(data).length,
+      hex: Buffer.isBuffer(data) ? data.toString("hex") : undefined,
+      base64: Buffer.isBuffer(data) ? data.toString("base64") : undefined,
+    };
+    // if likely text, try parse JSON
+    const parsed = safeParseJsonMaybe(data);
+    if (parsed !== null) entry.parsed = parsed;
+    pushLog(entry);
+
+    // console output (compact)
+    if (entry.isBinary) {
+      console.log("[WS MSG BINARY] size=%d hex=%s", entry.size, entry.hex.slice(0, 120));
+      if (parsed) console.log("[WS MSG JSON] ", parsed);
+    } else {
+      console.log("[WS MSG TEXT] ", typeof data === "string" ? data.slice(0, 160) : String(data).slice(0, 160));
+      if (parsed) console.log("[WS MSG JSON] ", parsed);
+    }
+  });
+
+  // low-level ping/pong frames (transport)
+  wsInstance.on("ping", (data) => {
+    pushLog({ type: "transport_ping", hex: hex(data), base64: b64(data) });
+    console.log("[WS TRANSPORT PING] hex=", hex(data));
+    // don't automatically pong here — let ws handle default? ws library replies automatically to ping if we call ws.pong
+    // we'll also log and optionally respond
+    try { wsInstance.pong(data); pushLog({ type: "transport_pong_sent", hex: hex(data) }); console.log("[WS TRANSPORT PONG] sent"); } catch(e){ console.warn("[WS TRANSPORT PONG ERR]", e.message); }
+  });
+
+  wsInstance.on("pong", (data) => {
+    pushLog({ type: "transport_pong", hex: hex(data), base64: b64(data) });
+    console.log("[WS TRANSPORT PONG RECV] hex=", hex(data));
+  });
+
+  wsInstance.on("close", (code, reason) => {
+    const reasonStr = reason && reason.length ? reason.toString() : "";
+    pushLog({ type: "ws_close", code, reason: reasonStr });
+    console.log(`[WS] CLOSE code=${code} reason=${reasonStr}`);
+    // will trigger reconnect by outer logic
+  });
+
+  wsInstance.on("error", (err) => {
+    pushLog({ type: "ws_error", error: String(err) });
+    console.error("[WS] ERROR", err?.message || err);
+  });
+}
+
+async function start() {
+  while (running) {
     try {
-      // if lastFrames contain candidate, try raw-pong first
-      const last = lastFrames.length ? lastFrames[lastFrames.length-1] : null;
-      if (last) {
-        attemptRawPongFrom(last);
+      const token = await fetchToken();
+      if (!token) {
+        console.log("[START] no token, retry in 3s");
+        await new Promise((r) => setTimeout(r, 3000));
+        continue;
       }
-      // fallback json pong
-      tryJsonPong();
-    } catch (e) { console.error(nowISO(), "[ERR] pongTimer", e && e.message); }
-    // reschedule with a slight jitter (±1000ms)
-    const jitter = Math.floor(Math.random() * 2000) - 1000;
-    pongTimer = setTimeout(() => {}, Math.max(1000, nextPongMs + jitter));
-  }, intervalMs);
-  console.log(nowISO(), "[PONG TIMER] next in ms:", intervalMs);
-}
 
-function clearPongTimer(){
-  if (pongTimer) { clearTimeout(pongTimer); pongTimer = null; nextPongMs = null; }
-}
+      console.log(`[START] connecting... ${WS_URL}`);
+      pushLog({ type: "start_connect", url: WS_URL, token_present: !!token });
 
-/* -------- send helpers -------- */
+      ws = new WebSocket(WS_URL);
 
-function tryJsonPong(){
-  if (!ws || ws.readyState !== ws.OPEN) return false;
-  try {
-    const payload = JSON.stringify({ type: 3 });
-    ws.send(payload);
-    console.log(nowISO(), "[PONG] JSON sent ->", payload);
-    writeLog({ event: "pong_sent", method: "json", payload });
-    return true;
-  } catch (e) {
-    console.error(nowISO(), "[ERR] tryJsonPong", e && e.message);
-    return false;
-  }
-}
+      attachWsHandlers(ws);
 
-function tryTransportPong(data){
-  // call ws.pong (transport-level) if supported by ws lib
-  if (!ws || ws.readyState !== ws.OPEN) return false;
-  try {
-    ws.pong(data || Buffer.from([]));
-    console.log(nowISO(), "[PONG] transport-level pong sent");
-    writeLog({ event: "pong_sent", method: "transport", payloadLen: (data ? data.length : 0) });
-    return true;
-  } catch (e) {
-    console.error(nowISO(), "[ERR] tryTransportPong", e && e.message);
-    return false;
-  }
-}
+      // after open, do the usual Centrifugo-style connect and subscribe
+      const onceOpen = new Promise((resolve) => {
+        ws.once("open", () => resolve());
+      });
 
-function attemptRawPongFrom(frameEntry){
-  if (!ws || ws.readyState !== ws.OPEN) return false;
-  if (!frameEntry || !frameEntry.raw) return false;
+      await onceOpen;
 
-  const buf = Buffer.from(frameEntry.raw); // copy
-  let s = buf.toString('utf8');
-
-  // conservative replacements:
-  //  - if we see "\"ping\":<num>" replace with "\"type\":3"
-  //  - else if we see "\"pong\":true" replace with "\"type\":3"
-  //  - else if we see "\"connect\":{...}" try insert {"type":3} heuristically
-  let replaced = false;
-  // regex patterns
-  const pingRe = /"ping"\s*:\s*\d+/;
-  const pongTrueRe = /"pong"\s*:\s*true/;
-  if (pingRe.test(s)) {
-    s = s.replace(pingRe, '"type":3');
-    replaced = true;
-  } else if (pongTrueRe.test(s)) {
-    s = s.replace(pongTrueRe, '"type":3');
-    replaced = true;
-  } else {
-    // try to detect connect wrapper and create minimal raw reply
-    // do NOT mutate original too aggressively - fallback later
-    const connectRe = /"connect"\s*:\s*\{[^}]*\}/;
-    if (connectRe.test(s)) {
-      // create minimal: {"type":3}
-      const raw = Buffer.from(JSON.stringify({ type: 3 }));
+      // send connect (JSON) — keep same shape as browser client
       try {
-        ws.send(raw);
-        console.log(nowISO(), "[PONG] raw minimal JSON buffer sent (fallback)");
-        writeLog({ event: "pong_sent", method: "raw_minimal", base64: raw.toString('base64') });
-        return true;
-      } catch (e) {}
-    }
-  }
-
-  if (!replaced) {
-    // no safe replacement found; try transport-level pong and json pong then return
-    tryTransportPong();
-    tryJsonPong();
-    return false;
-  }
-
-  // safety: ensure result is valid utf8 JSON
-  try {
-    JSON.parse(s);
-  } catch (e) {
-    // invalid JSON -> don't send corrupted frame
-    console.log(nowISO(), "[PONG] attempted replacement produced invalid JSON; aborting raw-pong");
-    return false;
-  }
-
-  // send buffer
-  const out = Buffer.from(s, 'utf8');
-  try {
-    ws.send(out);
-    console.log(nowISO(), "[PONG] raw-based sent -> hex_sample:", out.slice(0,64).toString('hex'));
-    writeLog({ event: "pong_sent", method: "raw_based", hex_sample: out.slice(0,LOG_SAMPLE_BYTES).toString('hex'), base64_sample: out.slice(0,LOG_SAMPLE_BYTES).toString('base64') });
-    return true;
-  } catch (e) {
-    console.error(nowISO(), "[ERR] attemptRawPongFrom.send", e && e.message);
-    return false;
-  }
-}
-
-/* -------- main ws logic -------- */
-
-async function startWS(){
-  const token = await fetchToken();
-  if (!token) {
-    console.log(nowISO(), "[WARN] token missing; retry in 3s");
-    setTimeout(startWS, 3000);
-    return;
-  }
-
-  openLogStream();
-  console.log(nowISO(), "[START] connecting...", WS_URL);
-  writeLog({ event: "start_connect", wsUrl: WS_URL });
-
-  ws = new WebSocket(WS_URL, {
-    // headers can be tuned if necessary
-    headers: {
-      // Origin can be used sometimes — leave commented for now
-      // Origin: "https://csgoyz.run",
-      // "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ..."
-    }
-  });
-
-  ws.on('open', () => {
-    reconnectDelay = RECONNECT_BASE_MS;
-    console.log(nowISO(), "[WS] OPEN");
-    writeLog({ event: "open" });
-
-    // send centrifugo connect
-    const connectMsg = { id: 1, connect: { token, subs: {} } };
-    try {
-      ws.send(JSON.stringify(connectMsg));
-      console.log(nowISO(), "[LOG] connect_sent client", { token_present: !!token });
-      writeLog({ event: "connect_sent", token_present: !!token, connectMsg });
-    } catch (e){
-      console.error(nowISO(), "[ERR] send connect", e && e.message);
-    }
-
-    // schedule a default heartbeat if we don't learn ping interval
-    // will be replaced by value from connect_ack if provided (see message handler)
-  });
-
-  // 'ping' event (websocket-level)
-  ws.on('ping', (data) => {
-    console.log(nowISO(), "[WS] opcode: ping received, len=", data && data.length);
-    writeLog({ event: "ws_ping", len: data ? data.length : 0, hex: data ? data.toString('hex') : null });
-    // reply with transport-level pong
-    tryTransportPong(data);
-  });
-
-  // 'pong' event (websocket-level)
-  ws.on('pong', (data) => {
-    console.log(nowISO(), "[WS] opcode: pong received, len=", data && data.length);
-    writeLog({ event: "ws_pong", len: data ? data.length : 0 });
-  });
-
-  ws.on('message', (data, isBinary) => {
-    try {
-      if (isBinary) {
-        const buf = Buffer.from(data);
-        const entry = pushFrame(buf);
-
-        // try parse as JSON (safe)
-        let parsed = null;
-        try {
-          parsed = JSON.parse(buf.toString('utf8'));
-          writeLog({ event: "frame_parsed_json", parsed });
-        } catch (e){ /* not JSON -> keep raw */ }
-
-        // If parsed JSON contains connect + ping info -> schedule heartbeat with that interval
-        if (parsed && parsed.connect && parsed.connect.ping) {
-          const pingMs = (Number(parsed.connect.ping) || 25) * 1000;
-          // schedule next pong somewhat earlier (reduce by 1000-3000ms)
-          const sendIn = Math.max(1000, Math.floor(pingMs - 2000 + (Math.random()*800 - 400)));
-          schedulePongInterval(sendIn);
-          writeLog({ event: "connect_ack", client: parsed.connect.client, ping: parsed.connect.ping });
-        }
-
-        // If parsed JSON contains explicit "type":2 (server ping) -> respond immediately
-        if (parsed && (parsed.type === 2 || parsed.ping !== undefined)) {
-          writeLog({ event: "detected_server_ping", parsed });
-          // reply transport-level + json + raw attempt
-          tryTransportPong();
-          tryJsonPong();
-          attemptRawPongFrom(entry);
-        }
-
-        // If push messages — decide to ignore or log minimally
-        if (parsed && parsed.push) {
-          if (!IGNORE_PUSH) {
-            writeLog({ event: "push", push: parsed.push });
-            console.log(nowISO(), "[WS MSG push] channel", parsed.push.channel);
-          } else {
-            // log only a compact marker
-            writeLog({ event: "push_ignored", channel: parsed.push.channel || null });
-          }
-        } else if (parsed) {
-          // generic parsed JSON message (non-push)
-          console.log(nowISO(), "[MSG binary->JSON] parsed full", parsed);
-        } else {
-          // raw binary + not JSON: dump short sample to console
-          console.log(nowISO(), "[MSG binary] frame received { totalSize:", buf.length, ", hex_sample:", entry.hex_sample, "}");
-        }
-      } else {
-        // text frame
-        const txt = data.toString('utf8');
-        writeLog({ event: "frame_text", text: txt.length > 1000 ? txt.slice(0,1000) + "..." : txt });
-        let j = null;
-        try { j = JSON.parse(txt); } catch {}
-        if (j && j.ping !== undefined) {
-          console.log(nowISO(), "[MSG JSON ping] ->", j);
-          // immediate responses
-          tryJsonPong();
-        } else {
-          console.log(nowISO(), "[MSG TEXT]", j || txt);
-        }
-      }
-    } catch (e) {
-      console.error(nowISO(), "[ERR] message handler", e && e.message);
-    }
-  });
-
-  ws.on('close', (code, reason) => {
-    console.log(nowISO(), "[CLOSE]", code, reason && reason.toString ? reason.toString() : reason);
-    writeLog({ event: "close", code, reason: reason && reason.toString ? reason.toString() : reason });
-    clearPongTimer();
-    // reconnect
-    setTimeout(() => {
-      reconnectDelay = Math.min(RECONNECT_MAX_MS, reconnectDelay * 1.5);
-      startWS();
-    }, reconnectDelay);
-  });
-
-  ws.on('error', (err) => {
-    console.error(nowISO(), "[WS ERROR]", err && (err.message || err.toString()));
-    writeLog({ event: "error", message: err && (err.message || err.toString()) });
-    // error will usually lead to close -> reconnection
-  });
-
-  // small helper: subscribe to safe channel list after open (delayed)
-  const subscribeLater = () => {
-    setTimeout(() => {
-      try {
-        CHANNELS.forEach((ch, idx) => {
-          const id = 100 + idx;
-          ws.send(JSON.stringify({ id, subscribe: { channel: ch } }));
-          console.log(nowISO(), "[LOG] subscribe_sent client", { channel: ch, id });
-          writeLog({ event: "subscribe_sent", channel: ch, id });
-        });
+        const connectPayload = {
+          id: 1,
+          connect: { token, subs: {} }
+        };
+        ws.send(JSON.stringify(connectPayload));
+        pushLog({ type: "connect_sent", payload: connectPayload });
+        console.log("[WS->] CONNECT sent");
       } catch (e) {
-        console.error(nowISO(), "[ERR] subscribe", e && e.message);
+        pushLog({ type: "connect_send_error", error: String(e) });
+        console.error("[ERR] connect send failed", e);
       }
-    }, 200);
-  };
-  // call subscribeLater shortly after open
-  setTimeout(subscribeLater, 300);
+
+      // small delay then subscribe to channels
+      await new Promise((r) => setTimeout(r, 200));
+      CHANNELS.forEach((ch, i) => {
+        try {
+          const payload = { id: 100 + i, subscribe: { channel: ch } };
+          ws.send(JSON.stringify(payload));
+          pushLog({ type: "subscribe_sent", channel: ch, id: payload.id });
+          console.log("[WS->] subscribe", ch);
+        } catch (e) {
+          pushLog({ type: "subscribe_send_error", channel: ch, error: String(e) });
+          console.error("[ERR] subscribe send failed", e);
+        }
+      });
+
+      // wait until socket closes — we will detect close and loop to reconnect
+      await new Promise((resolve) => {
+        ws.once("close", () => resolve());
+        ws.once("error", () => resolve());
+      });
+
+      // If we reach here, socket closed — loop and reconnect with backoff
+      reconnectAttempts++;
+      const backoff = Math.min(30000, RECONNECT_BASE_MS * Math.pow(1.5, reconnectAttempts));
+      console.log(`[RECONNECT] attempt=${reconnectAttempts} backoff=${Math.round(backoff)}ms`);
+      await new Promise((r) => setTimeout(r, backoff));
+    } catch (e) {
+      pushLog({ type: "main_loop_error", error: String(e) });
+      console.error("[MAIN ERR]", e);
+      await new Promise((r) => setTimeout(r, 2000));
+    }
+  }
 }
 
-const app = express();
-app.get("/", (req,res)=>res.send("ok"));
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, ()=> console.log("HTTP listen", PORT));
+// Periodic dump of logs to file
+setInterval(() => {
+  try {
+    dumpLogsToFile();
+  } catch (e) {
+    console.error("[DUMP ERR]", e);
+  }
+}, DUMP_INTERVAL_MS);
 
-/* -------- CLI control / graceful shutdown -------- */
-
-process.on('SIGINT', () => {
-  console.log(nowISO(), "[SIGINT] Shutting down...");
-  writeLog({ event: "shutdown" });
-  if (currentLogStream) currentLogStream.end();
-  try { if (ws) ws.close(); } catch {}
+// graceful shutdown
+process.on("SIGINT", () => {
+  console.log("SIGINT -> stopping");
+  running = false;
+  try { if (ws) ws.close(); } catch (e) {}
+  dumpLogsToFile();
+  process.exit(0);
+});
+process.on("SIGTERM", () => {
+  console.log("SIGTERM -> stopping");
+  running = false;
+  try { if (ws) ws.close(); } catch (e) {}
+  dumpLogsToFile();
   process.exit(0);
 });
 
-/* start */
-startWS();
+// simple HTTP health endpoint for Render
+const app = express();
+app.get("/", (req, res) => res.send("ok"));
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, () => console.log("HTTP listen", PORT));
+
+// Start main loop
+if (STARTUP_LOG_TO_FILE) dumpLogsToFile();
+start().catch((e) => {
+  console.error("[FATAL]", e);
+  dumpLogsToFile();
+  process.exit(1);
+});
