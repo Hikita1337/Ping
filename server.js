@@ -1,66 +1,51 @@
-// server.js — WS sniffer (full raw + JSON pong on server `{}` + optional periodic pong)
-// ES module (Node 18+ / 20 / 22)
+// server.js — WS sniffer (final)
+// ES module (Node >=18+). Requires "type":"module" in package.json
 import WebSocket from "ws";
-import fs from "fs";
+import fetch from "node-fetch";
+import express from "express";
 import os from "os";
-import path from "path";
-import process from "process";
-import http from "http";
 
-// Configuration via ENV
+// -------- CONFIG (env-overridable) --------
 const WS_URL = process.env.WS_URL || "wss://ws.cs2run.app/connection/websocket";
-const CHANNELS = (process.env.CHANNELS || "csgorun:crash,csgorun:main").split(",").map(s => s.trim()).filter(Boolean);
 const TOKEN_URL = process.env.TOKEN_URL || "https://cs2run.app/current-state";
+const CHANNELS = (process.env.CHANNELS || "system:public").split(",").map(s => s.trim()).filter(Boolean);
+// RAM log limit in bytes (default 100 MiB)
+const MAX_LOG_BYTES = Number(process.env.MAX_LOG_BYTES || 100 * 1024 * 1024);
+// How often to print "session ok" to console (ms)
+const SESSION_PULSE_MS = Number(process.env.SESSION_PULSE_MS || 5 * 60 * 1000);
+// How many initial minutes to verbose-log pings
+const VERBOSE_PING_MINUTES = Number(process.env.VERBOSE_PING_MINUTES || 5);
+// Rough pong interval (ms) after connect_ack; jitter will be added
+const PONG_INTERVAL_BASE_MS = Number(process.env.PONG_INTERVAL_BASE_MS || 22000);
+// HTTP port (Render needs a bound port)
+const PORT = Number(process.env.PORT || process.env.PORT_BIND || 10000);
 
-const PORT = Number(process.env.PORT || 10000); // Render free default open port
-const LOG_PUSH_FULL = process.env.LOG_PUSH_FULL === "1" || false; // if true — log full push payloads (spammy)
-const SEND_PERIODIC_PONG = process.env.SEND_PERIODIC_PONG === "1" || false; // default off (avoid shooting blindly)
-const PERIODIC_PONG_MS = Number(process.env.PERIODIC_PONG_MS || 22000); // if periodic pong enabled
-const MAX_LOG_ENTRIES = Number(process.env.MAX_LOG_ENTRIES || 40000);
-const DUMP_INTERVAL_MS = Number(process.env.DUMP_INTERVAL_MS || 2 * 60 * 1000); // dump every 2 minutes
-const RECONNECT_BASE_MS = 2000;
+// -------- In-memory log store (size-limited) --------
+let logs = []; // array of entries
+let logsBytes = 0;
 
-let ws = null;
-let running = true;
-let reconnectAttempts = 0;
-let logs = []; // circular buffer
-let periodicPongTimer = null;
-
-// Simple logger that pushes to circular buffer + console
-function pushLog(entry) {
-  entry.ts = (new Date()).toISOString();
-  logs.push(entry);
-  if (logs.length > MAX_LOG_ENTRIES) logs.splice(0, logs.length - MAX_LOG_ENTRIES);
-  // Console friendly printing
-  const short = { ...entry };
-  if (short.raw && short.raw.hex) short.raw.hex = short.raw.hex.slice(0, 120) + (short.raw.hex.length > 120 ? "..." : "");
-  console.log(JSON.stringify(short));
-}
-
-function hex(buf) {
-  if (!buf) return "";
-  return Buffer.isBuffer(buf) ? buf.toString("hex") : Buffer.from(String(buf)).toString("hex");
-}
-function b64(buf) {
-  if (!buf) return "";
-  return Buffer.isBuffer(buf) ? buf.toString("base64") : Buffer.from(String(buf)).toString("base64");
-}
-
-async function fetchToken() {
+function approxSizeBytes(obj) {
   try {
-    // Node has global fetch in modern runtimes
-    const r = await fetch(TOKEN_URL, { cache: "no-store" });
-    const j = await r.json();
-    const token = j?.data?.main?.centrifugeToken;
-    pushLog({ type: "token_fetch", ok: !!token });
-    return token || null;
-  } catch (e) {
-    pushLog({ type: "token_fetch_error", error: String(e) });
-    return null;
+    return Buffer.byteLength(JSON.stringify(obj), "utf8");
+  } catch {
+    return 100;
   }
 }
 
-function safeParseJsonMaybe(buf) {
+function pushLog(entry) {
+  entry.ts = new Date().toISOString();
+  const size = approxSizeBytes(entry);
+  logs.push(entry);
+  logsBytes += size;
+  // Evict oldest until under limit (simple FIFO)
+  while (logsBytes > MAX_LOG_BYTES && logs.length > 1) {
+    const ev = logs.shift();
+    logsBytes -= approxSizeBytes(ev);
+  }
+}
+
+// -------- Utilities --------
+function safeJSONParse(buf) {
   try {
     const txt = Buffer.isBuffer(buf) ? buf.toString("utf8") : String(buf);
     return JSON.parse(txt);
@@ -69,279 +54,288 @@ function safeParseJsonMaybe(buf) {
   }
 }
 
-function dumpLogsToFile() {
-  if (!logs.length) {
-    console.log("[DUMP] no logs to save");
-    return;
-  }
+function humanDuration(ms) {
+  const sec = Math.floor(ms / 1000) % 60;
+  const min = Math.floor(ms / 60000) % 60;
+  const hrs = Math.floor(ms / 3600000);
+  return `${String(hrs).padStart(2,"0")}:${String(min).padStart(2,"0")}:${String(sec).padStart(2,"0")}`;
+}
+
+// minimal heuristic: treat channels containing these substrings as "game pushes"
+const GAME_CHANNEL_SUBSTR = ["crash", "main", "bet", "game", "topBet", "csgorun"];
+
+// -------- State --------
+let ws = null;
+let sessionStart = null;
+let sessionTimerHandle = null;
+let sessionPulseHandle = null;
+let pongTimerHandle = null;
+let verbosePingWindowMs = VERBOSE_PING_MINUTES * 60 * 1000;
+let lastConnectClientId = null;
+
+// -------- Fetch token --------
+async function fetchToken() {
   try {
-    const fn = path.join(os.tmpdir(), `ws_sniffer_dump_${Date.now()}.json`);
-    fs.writeFileSync(fn, JSON.stringify({ exportedAt: new Date().toISOString(), logs }, null, 2));
-    console.log("[DUMP] saved logs ->", fn, `(${logs.length} entries)`);
-    pushLog({ type: "dump_saved", file: fn, entries: logs.length });
-    // keep logs in memory (we do not clear intentionally)
+    const r = await fetch(TOKEN_URL, { cache: "no-store", timeout: 5000 });
+    const j = await r.json();
+    const token = j?.data?.main?.centrifugeToken || j?.data?.centrifugeToken || null;
+    pushLog({ type: "token_fetch", ok: !!token });
+    return token;
   } catch (e) {
-    console.error("[DUMP ERR]", e);
+    pushLog({ type: "token_fetch_error", error: String(e) });
+    return null;
   }
 }
 
-// Prepare a binary JSON PONG buffer: {"type":3}
-function makeBinaryJsonPong() {
-  return Buffer.from(JSON.stringify({ type: 3 }));
-}
-
-// Attach handlers for a given WebSocket instance
-function attachWsHandlers(wsInstance) {
-  wsInstance.on("open", () => {
-    reconnectAttempts = 0;
-    pushLog({ type: "ws_open", url: WS_URL });
-    console.log("[WS] OPEN");
-  });
-
-  wsInstance.on("message", (data, isBinary) => {
-    // record raw
-    const rawEntry = {
-      type: "raw_msg",
-      isBinary: !!isBinary,
-      size: Buffer.isBuffer(data) ? data.length : String(data).length,
-      raw: {
-        hex: Buffer.isBuffer(data) ? data.toString("hex") : undefined,
-        base64: Buffer.isBuffer(data) ? data.toString("base64") : undefined,
-        text: (!Buffer.isBuffer(data) && typeof data === "string") ? data.slice(0, 2000) : undefined
-      }
-    };
-
-    // try parse JSON
-    const parsed = safeParseJsonMaybe(data);
-    if (parsed !== null) rawEntry.parsed = parsed;
-
-    pushLog(rawEntry);
-
-    // Console-friendly handling & behavior
-    if (parsed !== null) {
-      // Centrifugo-style server ping often comes as empty object {}
-      const isEmptyObject = (typeof parsed === "object" && parsed !== null && Object.keys(parsed).length === 0);
-      if (isEmptyObject) {
-        pushLog({ type: "server_ping_detected", note: "empty JSON frame {} received" });
-        // Respond immediately with binary JSON pong
-        try {
-          const pongBuf = makeBinaryJsonPong();
-          wsInstance.send(pongBuf, { binary: true }, (err) => {
-            if (err) pushLog({ type: "send_error", error: String(err) });
-            else pushLog({ type: "json_pong_sent", detail: { reason: "server_empty_json", hex: pongBuf.toString("hex") } });
-          });
-          console.log("[PONG] binary JSON sent ->", pongBuf.toString());
-        } catch (e) {
-          pushLog({ type: "pong_send_err", error: String(e) });
-        }
-        return;
-      }
-
-      // If it's connect ack/info (id:1 connect:{...})
-      if (parsed.connect && parsed.id === 1) {
-        pushLog({ type: "connect_ack", client: parsed.connect.client || null, meta: parsed.connect });
-        console.log("[WS MSG] connect ack/info:", parsed.connect);
-        // If periodic pong mode enabled -> start periodic timer AFTER connect ack
-        if (SEND_PERIODIC_PONG) {
-          if (periodicPongTimer) clearInterval(periodicPongTimer);
-          // jitter +/- 800 ms to mimic browser
-          const jitter = Math.floor(Math.random() * 1600) - 800;
-          const interval = Math.max(1000, PERIODIC_PONG_MS + jitter);
-          periodicPongTimer = setInterval(() => {
-            try {
-              const b = makeBinaryJsonPong();
-              wsInstance.send(b, { binary: true }, (err) => {
-                if (err) pushLog({ type: "periodic_pong_error", error: String(err) });
-                else pushLog({ type: "periodic_pong_sent", hex: b.toString("hex") });
-              });
-              console.log("[PERIODIC PONG] sent");
-            } catch (e) {
-              pushLog({ type: "periodic_pong_exception", error: String(e) });
-            }
-          }, interval);
-          pushLog({ type: "periodic_pong_started", intervalMs: interval });
-        }
-        return;
-      }
-
-      // Subscription ack/result messages
-      if (parsed.id && String(parsed.id).startsWith("1")) {
-        // don't spam, just acknowledge
-        pushLog({ type: "msg_with_id", id: parsed.id, raw: parsed });
-        console.log("[WS MSG ID]", parsed.id);
-        return;
-      }
-
-      // push messages (game updates) are extremely spammy: filter them unless user asked to log full
-      if (parsed.push) {
-        const ch = parsed.push.channel || "(unknown)";
-        if (LOG_PUSH_FULL) {
-          pushLog({ type: "push_full", channel: ch, payload: parsed.push.pub });
-          console.log("[WS PUSH]", ch, parsed.push.pub);
-        } else {
-          pushLog({ type: "push_ignored", channel: ch });
-          console.log("[WS PUSH IGNORED]", ch);
-        }
-        return;
-      }
-
-      // Other structured messages — log
-      pushLog({ type: "message_parsed", content: parsed });
-      console.log("[WS MSG PARSED]", parsed);
-      return;
-    }
-
-    // If not JSON-parsable: leave raw dump (hex/base64 already stored)
-    pushLog({ type: "message_nonjson", note: "non-json payload received" });
-    console.log("[WS MSG NON-JSON] size=", rawEntry.size);
-  });
-
-  // Transport-level ping/pong events
-  wsInstance.on("ping", (data) => {
-    pushLog({ type: "transport_ping", hex: hex(data), base64: b64(data) });
-    console.log("[TRANSPORT PING] hex=", hex(data));
-    // reply transport-level pong immediately
+// -------- Behavior: send JSON PONG as binary after connect ack --------
+function schedulePongLoop(wsInstance) {
+  // clear previous
+  if (pongTimerHandle) { clearTimeout(pongTimerHandle); pongTimerHandle = null; }
+  const sendPong = () => {
+    if (!wsInstance || wsInstance.readyState !== wsInstance.OPEN) return;
+    const payload = Buffer.from(JSON.stringify({ type: 3 })); // binary JSON pong
     try {
-      wsInstance.pong(data);
-      pushLog({ type: "transport_pong_sent", hex: hex(data) });
-      console.log("[TRANSPORT PONG] sent");
+      wsInstance.send(payload);
+      pushLog({ type: "pong_sent", transport: "binary_json", payload: { type: 3 } });
+      // schedule next with jitter +/- 1s
+      const jitter = Math.floor((Math.random() - 0.5) * 2000);
+      const next = Math.max(15000, PONG_INTERVAL_BASE_MS + jitter);
+      pongTimerHandle = setTimeout(sendPong, next);
     } catch (e) {
-      pushLog({ type: "transport_pong_err", error: String(e) });
+      pushLog({ type: "pong_send_error", error: String(e) });
     }
-  });
-
-  wsInstance.on("pong", (data) => {
-    pushLog({ type: "transport_pong_recv", hex: hex(data), base64: b64(data) });
-    console.log("[TRANSPORT PONG RECV] hex=", hex(data));
-  });
-
-  wsInstance.on("close", (code, reason) => {
-    const rs = (reason && reason.length) ? reason.toString() : "";
-    pushLog({ type: "ws_close", code, reason: rs });
-    console.log(`[WS] CLOSE code=${code} reason=${rs}`);
-    // stop periodic timer
-    if (periodicPongTimer) {
-      clearInterval(periodicPongTimer);
-      periodicPongTimer = null;
-      pushLog({ type: "periodic_pong_stopped" });
-    }
-  });
-
-  wsInstance.on("error", (err) => {
-    pushLog({ type: "ws_error", error: String(err) });
-    console.error("[WS ERROR]", err?.message || err);
-  });
+  };
+  // initial schedule: ~PONG_INTERVAL_BASE_MS with small jitter
+  const initJitter = Math.floor((Math.random() - 0.5) * 2000);
+  pongTimerHandle = setTimeout(sendPong, Math.max(15000, PONG_INTERVAL_BASE_MS + initJitter));
 }
 
-// Main loop: connect -> handshake -> subscribe -> wait for close -> reconnect
-async function mainLoop() {
-  while (running) {
-    try {
-      // fetch token (if fails retry)
-      const token = await fetchToken();
-      if (!token) {
-        console.log("[MAIN] token not found, retry in 3s");
-        await new Promise(r => setTimeout(r, 3000));
-        continue;
-      }
+// -------- Create WS and handlers --------
+async function startWSLoop() {
+  while (true) {
+    const token = await fetchToken();
+    if (!token) {
+      console.warn("[START] token not found, retrying in 3s");
+      await new Promise(r => setTimeout(r, 3000));
+      continue;
+    }
 
+    try {
+      console.log(`[RUN] connecting to ${WS_URL}`);
       pushLog({ type: "start_connect", url: WS_URL, token_present: true });
-      console.log("[RUN] connecting to", WS_URL);
 
       ws = new WebSocket(WS_URL);
 
-      attachWsHandlers(ws);
-
-      // wait for open
-      await new Promise((resolve, reject) => {
-        const to = setTimeout(() => reject(new Error("ws open timeout")), 15000);
-        ws.once("open", () => { clearTimeout(to); resolve(); });
-        ws.once("error", (e) => { clearTimeout(to); reject(e); });
-      });
-
-      // After open -> send connect payload as browser does
-      try {
-        const connectPayload = { id: 1, connect: { token, subs: {} } };
-        ws.send(JSON.stringify(connectPayload));
-        pushLog({ type: "connect_sent", payloadSummary: { id: 1 } });
-        console.log("[WS->] CONNECT sent");
-      } catch (e) {
-        pushLog({ type: "connect_send_error", error: String(e) });
-        console.error("[ERR] connect send failed", e);
-      }
-
-      // small delay then subscribe to channels (we'll log only subscribe attempt; server may reply unknown channel)
-      await new Promise(r => setTimeout(r, 200));
-      CHANNELS.forEach((ch, i) => {
-        try {
-          const payload = { id: 100 + i, subscribe: { channel: ch } };
-          ws.send(JSON.stringify(payload));
-          pushLog({ type: "subscribe_sent", channel: ch, id: payload.id });
-          console.log("[WS->] subscribe", ch);
-        } catch (e) {
-          pushLog({ type: "subscribe_send_error", channel: ch, error: String(e) });
-          console.error("[ERR] subscribe send failed", e);
+      // --- transport ping/pong frames
+      ws.on("ping", (data) => {
+        pushLog({ type: "transport_ping", hex: Buffer.isBuffer(data) ? data.toString("hex") : null });
+        // reply immediately
+        try { ws.pong(data); pushLog({ type: "transport_pong_sent" }); } catch (e) { pushLog({ type: "transport_pong_err", error: String(e) }); }
+        // verbose
+        if (Date.now() - (sessionStart || 0) < verbosePingWindowMs) {
+          console.log("[TRANSPORT PING]");
         }
       });
 
-      // Wait until close/error
-      await new Promise((resolve) => {
-        const onClose = () => resolve();
-        ws.once("close", onClose);
-        ws.once("error", onClose);
+      ws.on("pong", (data) => {
+        pushLog({ type: "transport_pong_received", hex: Buffer.isBuffer(data) ? data.toString("hex") : null });
+        if (Date.now() - (sessionStart || 0) < verbosePingWindowMs) {
+          console.log("[TRANSPORT PONG RECV]");
+        }
       });
 
-      // If closed, backoff and reconnect
-      reconnectAttempts++;
-      const backoff = Math.min(30000, RECONNECT_BASE_MS * Math.pow(1.5, reconnectAttempts));
-      console.log(`[RECONNECT] attempt=${reconnectAttempts} backoff=${Math.round(backoff)}ms`);
-      await new Promise(r => setTimeout(r, backoff));
+      ws.on("open", async () => {
+        sessionStart = Date.now();
+        lastConnectClientId = null;
+        pushLog({ type: "ws_open" });
+        console.log("[WS] OPEN");
+
+        // start session pulse
+        if (sessionPulseHandle) clearInterval(sessionPulseHandle);
+        sessionPulseHandle = setInterval(() => {
+          if (sessionStart && ws && ws.readyState === ws.OPEN) {
+            const uptime = humanDuration(Date.now() - sessionStart);
+            console.log(`[SESSION OK] uptime=${uptime}`);
+            pushLog({ type: "session_pulse", uptime });
+          }
+        }, SESSION_PULSE_MS);
+
+        // send "connect" following Centrifuge protocol used by site
+        const connectPayload = { id: 1, connect: { token, subs: {} } };
+        try {
+          ws.send(JSON.stringify(connectPayload));
+          pushLog({ type: "connect_sent", payload: { ...connectPayload, token_present: true } });
+          console.log("[WS->] CONNECT sent");
+        } catch (e) {
+          pushLog({ type: "connect_send_error", error: String(e) });
+        }
+
+        // wait a little then subscribe to chosen channels
+        setTimeout(() => {
+          CHANNELS.forEach((ch, i) => {
+            try {
+              const payload = { id: 100 + i, subscribe: { channel: ch } };
+              ws.send(JSON.stringify(payload));
+              pushLog({ type: "subscribe_sent", channel: ch, id: payload.id });
+              console.log(`[WS->] subscribe ${ch}`);
+            } catch (e) {
+              pushLog({ type: "subscribe_send_error", channel: ch, error: String(e) });
+            }
+          });
+        }, 200);
+      });
+
+      ws.on("message", (data, isBinary) => {
+        // raw logging minimal to avoid spam; try to parse JSON
+        const parsed = safeJSONParse(data);
+        // If this is the connect ack (id===1 && connect)
+        if (parsed && parsed.result && parsed.id === 1) {
+          pushLog({ type: "connect_ack", payload: parsed });
+          console.log("[WS MSG] CONNECTED ACK");
+        }
+        // some servers send connect as direct object {id:1, connect: {...}}
+        if (parsed && parsed.id === 1 && parsed.connect) {
+          lastConnectClientId = parsed.connect.client || lastConnectClientId;
+          pushLog({ type: "connect_info", payload: parsed.connect });
+          console.log(`[WS MSG] connect ack/info: ${JSON.stringify(parsed.connect)}`);
+          // start JSON PONG loop only after connect ack/info
+          schedulePongLoop(ws);
+        }
+
+        // If it's an empty JSON {} often used as keepalive — we log as lightweight
+        if (parsed && Object.keys(parsed).length === 0) {
+          pushLog({ type: "keepalive", raw: "{}" });
+          // don't spam console for keepalive
+          return;
+        }
+
+        // If message is a Centrifugo 'push' with game data -> ignore details (to avoid spam)
+        if (parsed && parsed.push && parsed.push.channel) {
+          const ch = String(parsed.push.channel || "");
+          const isGame = GAME_CHANNEL_SUBSTR.some(sub => ch.includes(sub));
+          if (isGame) {
+            // count / note but don't store full push
+            pushLog({ type: "push_ignored", channel: ch });
+            return;
+          }
+        }
+
+        // If message has id 100/101 subscribe ack or error => log
+        if (parsed && (parsed.id === 100 || parsed.id === 101)) {
+          pushLog({ type: "subscribe_msg", payload: parsed });
+          console.log("[WS MSG JSON]", parsed);
+          return;
+        }
+
+        // For other parsed JSON messages: store full content (careful with spam)
+        if (parsed) {
+          pushLog({ type: "message_json", payload: parsed });
+          console.log("[WS MSG JSON]", parsed);
+          return;
+        }
+
+        // If binary or non-JSON text, store a small sample: hex/base64/text snippet
+        if (Buffer.isBuffer(data)) {
+          const hexSample = data.slice(0, 160).toString("hex");
+          const b64Sample = data.slice(0, 120).toString("base64");
+          pushLog({ type: "message_binary", size: data.length, hex_sample: hexSample, base64_sample: b64Sample });
+          console.log("[WS MSG BINARY] size=%d sample=%s", data.length, hexSample.slice(0, 120));
+        } else {
+          const txt = String(data).slice(0, 600);
+          pushLog({ type: "message_text", text_sample: txt });
+          console.log("[WS MSG TEXT]", txt);
+        }
+      });
+
+      ws.on("close", (code, reason) => {
+        const reasonStr = reason && reason.length ? reason.toString() : "";
+        pushLog({ type: "ws_close", code, reason: reasonStr, session_uptime_ms: sessionStart ? Date.now() - sessionStart : 0 });
+        console.log(`[WS] CLOSE code=${code} reason=${reasonStr}`);
+        // cleanup timers
+        if (sessionPulseHandle) { clearInterval(sessionPulseHandle); sessionPulseHandle = null; }
+        if (pongTimerHandle) { clearTimeout(pongTimerHandle); pongTimerHandle = null; }
+        sessionStart = null;
+      });
+
+      ws.on("error", (err) => {
+        pushLog({ type: "ws_error", error: String(err) });
+        console.error("[WS] ERROR", err?.message || err);
+        // cleanup on error too
+        if (sessionPulseHandle) { clearInterval(sessionPulseHandle); sessionPulseHandle = null; }
+        if (pongTimerHandle) { clearTimeout(pongTimerHandle); pongTimerHandle = null; }
+        sessionStart = null;
+      });
+
+      // wait until socket closed or error triggers
+      await new Promise((resolve) => {
+        ws.once("close", () => resolve());
+        ws.once("error", () => resolve());
+      });
+
+      // on close -> loop will reconnect after short backoff
+      await new Promise(r => setTimeout(r, 2000));
     } catch (e) {
       pushLog({ type: "main_loop_exception", error: String(e) });
-      console.error("[MAIN EXCEPTION]", e?.message || e);
-      await new Promise(r => setTimeout(r, RECONNECT_BASE_MS));
+      console.error("[MAIN] exception:", e);
+      await new Promise(r => setTimeout(r, 2000));
     }
   }
 }
 
-// HTTP health endpoint (and endpoint to dump logs quickly)
-const server = http.createServer((req, res) => {
-  if (req.url === "/") {
-    res.writeHead(200, { "Content-Type": "text/plain" });
-    return res.end("ok\n");
+// -------- HTTP endpoints (health + logs) --------
+const app = express();
+app.use(express.json());
+
+app.get("/", (req, res) => res.send("ok"));
+
+// get logs (in-memory). Query params: limit (number), since (ISO ts)
+// returns as JSON array { logs: [...], meta: {...} }
+app.get("/logs", (req, res) => {
+  const limit = Math.min(10000, Number(req.query.limit || 1000));
+  const since = req.query.since ? new Date(req.query.since) : null;
+  let out = logs;
+  if (since && !isNaN(since.getTime())) {
+    out = out.filter(e => new Date(e.ts) >= since);
   }
-  if (req.url === "/logs") {
-    // return last N logs as JSON
-    const payload = { ts: new Date().toISOString(), last: logs.slice(-1000) };
-    res.writeHead(200, { "Content-Type": "application/json" });
-    return res.end(JSON.stringify(payload));
-  }
-  // other
-  res.writeHead(404); res.end("not found");
+  out = out.slice(-limit);
+  res.json({ meta: { total_stored: logs.length, bytes_est: logsBytes }, logs: out });
 });
 
-server.listen(PORT, () => console.log("[HTTP] listening", PORT));
+// quick endpoint to get summary
+app.get("/status", (req, res) => {
+  res.json({
+    ws_url: WS_URL,
+    channels: CHANNELS,
+    connected: !!(ws && ws.readyState === ws.OPEN),
+    clientId: lastConnectClientId,
+    storedLogs: logs.length,
+    storedBytes: logsBytes,
+    uptime_ms: sessionStart ? Date.now() - sessionStart : 0,
+  });
+});
 
-// Periodic dump to file (for Render artifact pickup)
-setInterval(() => {
-  dumpLogsToFile();
-}, DUMP_INTERVAL_MS);
+// Start HTTP server then WS loop
+app.listen(PORT, () => {
+  console.log("[HTTP] listening", PORT);
+  pushLog({ type: "http_listen", port: PORT });
+  // start WS loop asynchronously
+  startWSLoop().catch(e => {
+    pushLog({ type: "start_loop_error", error: String(e) });
+    console.error("[FATAL] startWSLoop failed", e);
+    process.exit(1);
+  });
+});
 
-// Graceful shutdown
+// graceful shutdown
 process.on("SIGINT", () => {
-  console.log("SIGINT -> stopping");
-  running = false;
+  console.log("SIGINT -> shutting down");
+  pushLog({ type: "shutdown", reason: "SIGINT" });
   try { if (ws) ws.close(); } catch {}
-  dumpLogsToFile();
   process.exit(0);
 });
 process.on("SIGTERM", () => {
-  console.log("SIGTERM -> stopping");
-  running = false;
+  console.log("SIGTERM -> shutting down");
+  pushLog({ type: "shutdown", reason: "SIGTERM" });
   try { if (ws) ws.close(); } catch {}
-  dumpLogsToFile();
   process.exit(0);
 });
-
-// Start
-mainLoop().catch(e => { console.error("[FATAL]", e); dumpLogsToFile(); process.exit(1); });
