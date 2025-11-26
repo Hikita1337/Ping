@@ -1,65 +1,76 @@
-import puppeteer from "puppeteer";
+import chromium from "@sparticuz/chromium";
+import puppeteer from "puppeteer-core";
 import { createClient } from "@supabase/supabase-js";
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
-const TARGET_URL = process.env.TARGET_URL;
 
-if (!SUPABASE_URL || !SUPABASE_KEY || !TARGET_URL) {
-  console.error("Missing env vars");
-  process.exit(1);
-}
+const supa = createClient(SUPABASE_URL, SUPABASE_KEY);
 
-const sb = createClient(SUPABASE_URL, SUPABASE_KEY);
+// Куда заходим (как пользователь)
+const TARGET = "https://csgoyz.run/crash";
 
-async function logWS(direction, payload, event_type, ws_channel = null) {
-  await sb.from("ws_logs").insert([
-    { direction, payload, event_type, ws_channel }
-  ]);
-}
+// User-Agent как Safari iPhone
+const UA =
+  "Mozilla/5.0 (iPhone; CPU iPhone OS 16_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.7 Mobile/15E148 Safari/604.1";
 
 async function run() {
   console.log("[LAUNCH] Chromium starting...");
 
   const browser = await puppeteer.launch({
-    headless: true,
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox"
-    ]
+    args: chromium.args,
+    defaultViewport: chromium.defaultViewport,
+    executablePath: await chromium.executablePath(),
+    headless: chromium.headless
   });
 
   const page = await browser.newPage();
-  console.log("[OPEN] Navigating to:", TARGET_URL);
+  await page.setUserAgent(UA);
 
-  await page.goto(TARGET_URL, { waitUntil: "networkidle2" });
+  await page.setViewport({
+    width: 390,
+    height: 844,
+    deviceScaleFactor: 3,
+    isMobile: true,
+    hasTouch: true
+  });
 
-  console.log("[HOOK] Attaching WebSocket listeners...");
+  const client = await page.target().createCDPSession();
 
-  page.on("websocketcreated", ws => {
-    console.log("[WS] New socket →", ws.url());
+  // HTTP + WS logging
+  await client.send("Network.enable");
 
-    ws.on("framereceived", async frame => {
-      await logWS(
-        "recv",
-        frame.payload,
-        "message"
-      );
-    });
-
-    ws.on("framesent", async frame => {
-      await logWS(
-        "send",
-        frame.payload,
-        "message"
-      );
+  client.on("Network.webSocketFrameReceived", async ({ requestId, timestamp, response }) => {
+    await supa.from("ws_logs").insert({
+      direction: "recv",
+      body: response.payloadData,
+      ts: new Date().toISOString()
     });
   });
 
-  console.log("[RUN] Monitoring Traffic...");
+  client.on("Network.webSocketFrameSent", async ({ requestId, timestamp, response }) => {
+    await supa.from("ws_logs").insert({
+      direction: "send",
+      body: response.payloadData,
+      ts: new Date().toISOString()
+    });
+  });
 
-  // Работать бесконечно
-  setInterval(() => {}, 60 * 1000);
+  client.on("Network.requestWillBeSent", async ({ request }) => {
+    await supa.from("ws_logs").insert({
+      direction: "http_req",
+      body: request.url,
+      ts: new Date().toISOString()
+    });
+  });
+
+  console.log("[NAVIGATE] →", TARGET);
+  await page.goto(TARGET, { waitUntil: "networkidle2" });
+
+  console.log("[READY] Sniffing traffic…");
 }
 
-run().catch(err => console.error("FAIL:", err));
+run().catch(err => {
+  console.error("FAIL:", err);
+  process.exit(1);
+});
