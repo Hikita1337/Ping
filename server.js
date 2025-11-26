@@ -6,7 +6,7 @@ import fetch from "node-fetch";
 const WS_URL = "wss://ws.cs2run.app/connection/websocket";
 const CHANNEL = "csgorun:crash";
 const PORT = 10000;
-const TOKEN_URL = "https://cs2run.app/api/v1/auth/guest";
+const TOKEN_URL = "https://cs2run.app/current-state";
 
 // Логи в памяти
 const logs = [];
