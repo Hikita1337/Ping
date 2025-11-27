@@ -14,7 +14,7 @@ const TOKEN_URL = process.env.TOKEN_URL || "https://cs2run.app/current-state";
 const CHANNEL = process.env.CHANNEL || "csgorun:crash"; // подписка для видимости
 const PORT = Number(process.env.PORT || 10000);
 
-const MAX_LOG_ENTRIES = Number(process.env.MAX_LOG_ENTRIES || 25000);
+const MAX_LOG_ENTRIES = Number(process.env.MAX_LOG_ENTRIES || 40000);
 const MAX_LOG_BYTES = Number(process.env.MAX_LOG_BYTES || 100 * 1024 * 1024); // 100 MiB
 const HEARTBEAT_MS = Number(process.env.HEARTBEAT_MS || 5 * 60 * 1000); // 5 минут
 const OPEN_TIMEOUT_MS = Number(process.env.OPEN_TIMEOUT_MS || 15000);
